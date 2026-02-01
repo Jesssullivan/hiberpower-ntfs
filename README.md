@@ -1,10 +1,14 @@
-# ASM2362 NVMe Recovery Research
+# ASM2362 NVMe Research Toys
 
-Experimental research into recovering NVMe SSDs exhibiting firmware-level write protection after FTL corruption. **This is not production software.**
+Experimental research into recovering NVMe SSDs exhibiting firmware-level write protection after FTL corruption. **This is a project**
+
+I used this nvme stick and the ASM2362 every day all day between 2017 and 2020 for all my laptop computing.  It happpily ran Tails, ubuntu budgie, and even windows via a little usb 3 enclosure velcroed to my laptop during this time.  I haven't thrown it away because I am stubborn, I think that it should continue to work forever. 
 
 ## The Problem
 
-A 256GB Silicon Power NVMe SSD connected via ASMedia ASM2362 USB bridge exhibits silent write failure after a Windows hibernate + power loss event.
+- A 256GB Silicon Power NVMe SSD connected via ASMedia ASM2362 USB bridge now exhibits silent write failure after a Windows hibernate + power loss event.
+- It is impossible to write zeros to this drive.  Amazing!  Never seen this before. 
+
 
 | Operation | Reports | Actual |
 |-----------|---------|--------|
@@ -211,19 +215,7 @@ zig build test
 zig build test-all
 ```
 
----
 
-## Implementation Status
-
-| Component | Status |
-|-----------|--------|
-| SCSI SG_IO layer | Complete |
-| ASM2362 0xe6 passthrough | Complete |
-| NVMe commands (Identify, SMART, Format, Sanitize, Security, Features) | Complete |
-| Frida hooks for Windows | Complete |
-| Command replay | Complete |
-
-~3,400 lines of Zig with 19 unit tests.
 
 ---
 
@@ -284,20 +276,3 @@ See [docs/INDEX.md](docs/INDEX.md) for documentation navigation.
 - [TCG Opal and NVMe](https://nvmexpress.org/wp-content/uploads/TCGandNVMe_Joint_White_Paper-TCG_Storage_Opal_and_NVMe_FINAL.pdf)
 - [nvme-cli](https://github.com/linux-nvme/nvme-cli)
 - [sedutil](https://github.com/Drive-Trust-Alliance/sedutil)
-
----
-
-## Contributing
-
-This is active research. Useful contributions:
-
-- USB capture data from SP Toolbox operations
-- Experience with Phison controller recovery
-- Ghidra/IDA analysis of SP Toolbox or SCSICmd.exe
-- Documentation of 0xe6 passthrough command sequences
-
-**Note:** The drive may be unrecoverable without professional tools (PC-3000 SSD). This research documents the failure mode and any accessible recovery paths.
-
-## License
-
-Research code - use at your own risk. No warranty implied.
