@@ -1,0 +1,65 @@
+# This file
+.gitignore
+
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Binary output
+asm2362-tool
+*.exe
+*.o
+*.a
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment / Credentials
+.env
+.env.*
+.env.local
+*.secret
+*.key
+
+# Logs
+*.log
+command_log.json
+
+# Data captures
+data/dumps/*.bin
+data/dumps/*.raw
+data/logs/*.json
+
+# QEMU images (large files)
+images/qcow2/*.qcow2
+images/qcow2/*.img
+
+# Large binary downloads (SP Toolbox ~81MB)
+downloads/
+
+# AI session artifacts
+.claude/
+
+# macOS
+.DS_Store
+
+# Linux
+*.core
+
+# Windows
+Thumbs.db
+
+# Documentation build (if used)
+docs/paper/*.aux
+docs/paper/*.log
+docs/paper/*.out
+docs/paper/*.pdf
+docs/paper/*.synctex.gz
+docs/paper/*.fls
+docs/paper/*.fdb_latexmk
