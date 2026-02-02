@@ -4,9 +4,8 @@ Experimental research into recovering NVMe SSDs exhibiting firmware-level write 
 
 I used this nvme stick and the ASM2362 every day all day between 2017 and 2020 for all my laptop computing.  It happpily ran Tails, ubuntu budgie, and even windows via a little usb 3 enclosure velcroed to my laptop during this time.  I haven't thrown it away because I am stubborn, I think that it should continue to work forever. 
 
-## The Problem
 
-- A 256GB Silicon Power NVMe SSD connected via ASMedia ASM2362 USB bridge now exhibits silent write failure after a Windows hibernate + power loss event.
+- 256GB Silicon Power NVMe SSD connected via ASMedia ASM2362 USB bridge now exhibits silent write failure after a Windows hibernate + power loss event.
 - It is impossible to write zeros to this drive.  Amazing!  Never seen this before. 
 
 
