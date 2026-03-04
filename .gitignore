@@ -66,3 +66,6 @@ docs/paper/*.pdf
 docs/paper/*.synctex.gz
 docs/paper/*.fls
 docs/paper/*.fdb_latexmk
+docs/paper/*.bbl
+docs/paper/*.blg
+docs/paper/*.toc
