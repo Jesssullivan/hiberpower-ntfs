@@ -1,19 +1,28 @@
-name: Notify Blog of Content Update
+# Template: Add this workflow to source repos that contain blog posts.
+# It notifies jesssullivan.github.io to collect new content via repository_dispatch.
+#
+# Prerequisite:
+#   BLOG_DISPATCH_TOKEN secret — a PAT with contents:write on jesssullivan.github.io
+#   Run: ./scripts/propagate-dispatch-secret.sh to set it on all repos
+#
+# Copy this file to: .github/workflows/notify-blog.yml
+
+name: Notify Blog Repo
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'docs/blog/**'
+    paths: ['blog/**', 'posts/**', 'docs/blog/**']
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+    if: vars.BLOG_DISPATCH_ENABLED != 'false'
     steps:
-      - name: Trigger blog collection
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.BLOG_DISPATCH_TOKEN }}
-          repository: jesssullivan/jesssullivan.github.io
-          event-type: external-post-update
-          client-payload: '{"source_repo": "Jesssullivan/hiberpower-ntfs"}'
+      - name: Trigger blog post collection
+        run: |
+          gh api repos/Jesssullivan/jesssullivan.github.io/dispatches \
+            -f event_type=blog-content-changed \
+            -f 'client_payload[source_repo]=${{ github.repository }}'
+        env:
+          GH_TOKEN: ${{ secrets.BLOG_DISPATCH_TOKEN }}
