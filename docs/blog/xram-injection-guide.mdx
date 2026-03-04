@@ -4,6 +4,7 @@ date: "2026-03-04"
 author: "J. Sullivan"
 tags: ["nvme", "asm2362", "xram", "scsi", "usb-bridge", "reverse-engineering", "zig", "low-level"]
 description: "A complete technical guide to the XRAM injection technique for sending arbitrary NVMe admin commands through the ASMedia ASM2362 USB-to-NVMe bridge, bypassing its firmware opcode whitelist."
+publish_to: blog
 ---
 
 # XRAM Injection: Bypassing USB Bridge Whitelists to Recover NVMe Drives
@@ -16,7 +17,7 @@ This is a critical problem when your NVMe SSD has entered a firmware-level read-
 
 **XRAM injection** is a technique that bypasses this whitelist entirely. Instead of asking the bridge firmware to forward an NVMe command through its whitelisted passthrough path, we write the NVMe command directly into the bridge chip's internal XRAM -- the 64KB memory space where the NVMe Admin Submission Queue physically resides. We place a fully-formed 64-byte NVMe Submission Queue entry directly into the hardware queue, then ring the NVMe controller's doorbell via a PCIe Transaction Layer Packet (TLP) write. The bridge firmware never sees the command in its passthrough logic. It is already sitting in the queue, ready for the NVMe controller to fetch via DMA.
 
-This post is a complete technical reference for the technique. It covers the ASM2362 hardware architecture, the vendor SCSI commands that provide XRAM access, the NVMe queue structures and their byte layouts, the PCIe TLP doorbell mechanism, and a step-by-step recovery procedure with troubleshooting guidance. All code examples reference the open-source [asm2362-tool](https://github.com/) written in Zig.
+This post is a complete technical reference for the technique. It covers the ASM2362 hardware architecture, the vendor SCSI commands that provide XRAM access, the NVMe queue structures and their byte layouts, the PCIe TLP doorbell mechanism, and a step-by-step recovery procedure with troubleshooting guidance. All code examples reference the open-source [asm2362-tool](https://github.com/Jesssullivan/hiberpower-ntfs) written in Zig.
 
 > **Warning**: The techniques described here involve direct manipulation of hardware bridge memory and NVMe controller queues. Incorrect use can brick drives, corrupt data, or render devices permanently unresponsive. This material is intended for firmware engineers, security researchers, and data recovery specialists who understand NVMe and SCSI at the register level. Only apply these techniques to hardware you own or have explicit authorization to access.
 
