@@ -1,0 +1,1027 @@
+---
+title: "ASM2362 XRAM Injection: A Complete Guide to NVMe Command Injection via USB Bridge Memory"
+date: "2026-03-04"
+author: "J. Sullivan"
+tags: ["nvme", "asm2362", "xram", "usb-bridge", "reverse-engineering", "firmware", "hardware-hacking"]
+description: "Complete technical reference for injecting NVMe admin commands through the ASMedia ASM2362 USB bridge's XRAM memory, bypassing the firmware opcode whitelist."
+---
+
+# ASM2362 XRAM Injection: A Complete Guide to NVMe Command Injection via USB Bridge Memory
+
+The ASMedia ASM2362 is a USB 3.1 Gen 2 to PCIe/NVMe bridge chip found in nearly every USB-to-M.2 NVMe enclosure on the market. It exposes a vendor-specific SCSI passthrough mechanism (opcode 0xE6) for tunneling NVMe admin commands over USB -- but the bridge firmware restricts this path to just two NVMe opcodes: Identify (0x06) and Get Log Page (0x02). Every other admin command is silently dropped.
+
+This guide documents a technique for bypassing that whitelist entirely. By writing directly to the bridge chip's internal XRAM -- the 64KB memory space where the NVMe Admin Submission Queue lives -- we can inject arbitrary NVMe admin commands and ring the controller's doorbell via PCIe TLP generation. No firmware modification required.
+
+This technique was developed during a drive recovery project and successfully used on 2026-03-04 to restore write capability to a Phison PS5012-E12 NVMe SSD (Silicon Power 256GB) that had entered firmware-level read-only mode after Windows hibernate corruption. The winning command was a Sanitize Block Erase injected into Admin SQ slot 0.
+
+> **Warning**: The techniques described here involve direct manipulation of hardware bridge memory and NVMe controller queues. Incorrect use can brick drives, corrupt data, or render devices permanently unresponsive. This material is intended for firmware engineers, security researchers, and data recovery specialists who understand NVMe and SCSI at the register level. Proceed at your own risk.
+
+---
+
+## 1. Prerequisites
+
+### Hardware
+
+- **ASMedia ASM2362 USB-NVMe bridge** (USB VID:PID `174c:2362`). This includes the ASM236x family generally. Most USB 3.1 Gen 2 NVMe enclosures use this chip.
+- An NVMe SSD connected through the bridge. The SSD controller does not matter for the XRAM injection technique itself, though the NVMe commands you inject must be appropriate for your controller.
+- A USB port on your Linux host. USB 3.x preferred for speed, but USB 2.0 works for admin commands.
+
+### Software
+
+- **Linux** with the `usb-storage` and `sg` kernel modules. Tested on Rocky Linux 10, kernel 6.12.x.
+- **sg3_utils** (`sg_raw`, `sg_inq`) -- useful for manual command testing, though the Zig tool handles everything.
+- Root access or `CAP_SYS_RAWIO` capability for SG_IO ioctl access.
+- Optionally: the `asm2362-tool` from this project (Zig 0.13.0+ to build).
+
+### Verification
+
+Confirm your bridge is an ASM236x:
+
+```bash
+lsusb -d 174c:2362
+# Expected: Bus 001 Device 003: ID 174c:2362 ASMedia Technology Inc. ASM236x Series
+
+# Or check dmesg:
+dmesg | grep -i asm
+# Expected: usb 1-3: new SuperSpeed USB device number 3 using xhci_hcd
+```
+
+---
+
+## 2. USB Driver Configuration
+
+### Why UAS Fails for Vendor Commands
+
+Linux defaults to the USB Attached SCSI (UAS) driver for USB 3.x devices. UAS works fine for standard SCSI commands and the 0xE6 NVMe passthrough, but **fails for the vendor SCSI commands 0xE4, 0xE5, and 0xE8** required for XRAM access.
+
+Under UAS, these vendor commands return `DID_ERROR` with `host_status=0x07` (errno -75, `EOVERFLOW`). The UAS protocol uses command streams that cannot handle the non-standard transfer semantics of the ASMedia vendor commands -- specifically, 0xE5 embeds its write data byte directly in the CDB with no data-out phase, which UAS does not expect.
+
+### Switching to BOT Mode
+
+The USB Bulk-Only Transport (BOT) protocol, implemented by the `usb-storage` kernel module, handles vendor commands correctly. To switch:
+
+```bash
+# Identify your USB port (check dmesg or lsusb -t)
+USB_PORT="1-3"  # Adjust to your setup
+
+sudo bash -c "
+  # Unbind device from current driver
+  echo '$USB_PORT' > /sys/bus/usb/drivers/usb/unbind
+
+  # Remove both drivers
+  rmmod uas 2>/dev/null
+  rmmod usb_storage 2>/dev/null
+
+  # Reload usb-storage with quirk flag to force BOT mode
+  modprobe usb-storage quirks=174c:2362:u
+
+  # Rebind device
+  echo '$USB_PORT' > /sys/bus/usb/drivers/usb/bind
+"
+```
+
+The `:u` quirk flag tells `usb-storage` to ignore UAS capability advertisements and use BOT instead.
+
+### Verification
+
+After rebinding, verify the driver:
+
+```bash
+# Check which driver is bound
+readlink /sys/bus/usb/devices/$USB_PORT/*/driver
+# Expected path should contain "usb-storage", NOT "uas"
+
+# The device will re-enumerate -- find the new /dev/sdX
+lsblk
+dmesg | tail -20  # Look for new sd device assignment
+```
+
+The device path may change (e.g., `/dev/sdb` becomes `/dev/sdc`) after re-enumeration. Always confirm before proceeding.
+
+### Making It Persistent
+
+To survive reboots, add the quirk to the kernel command line:
+
+```bash
+# /etc/default/grub
+GRUB_CMDLINE_LINUX="... usb-storage.quirks=174c:2362:u"
+```
+
+Or create a modprobe configuration:
+
+```bash
+# /etc/modprobe.d/asm2362-bot.conf
+options usb-storage quirks=174c:2362:u
+```
+
+---
+
+## 3. ASM2362 Vendor SCSI Commands
+
+The ASM2362 exposes eight vendor-specific SCSI opcodes beyond the standard command set. All are in the `0xE0-0xE8` range:
+
+| Opcode | Direction | CDB Size | Transfer Size | Purpose |
+|--------|-----------|----------|---------------|---------|
+| 0xE0 | Read | 6 | 128 bytes | Read bridge configuration |
+| 0xE1 | Write | 6 | 128 bytes | Write bridge configuration |
+| 0xE2 | Read | 6 | Variable | Flash (SPI) read |
+| 0xE3 | Write | 6 | Variable | Firmware flash write (from addr 0x80) |
+| **0xE4** | **Read** | **6** | **1-255 bytes** | **XDATA Read -- read from XRAM** |
+| **0xE5** | **Write** | **6** | **1 byte (in CDB)** | **XDATA Write -- write to XRAM** |
+| 0xE6 | Read | 16 | 4096 bytes | NVMe admin passthrough (whitelist-limited) |
+| **0xE8** | **None** | **12** | **0** | **Reset (CPU or PCIe)** |
+
+The three commands in bold -- 0xE4, 0xE5, and 0xE8 -- are the foundation of the XRAM injection technique. They provide direct access to the bridge chip's internal memory where the NVMe controller queues reside.
+
+Key distinction: 0xE6 tunnels NVMe commands through the bridge firmware, which applies an opcode whitelist. 0xE4/0xE5 bypass the firmware entirely by writing raw bytes to the memory locations the firmware uses.
+
+Reference: [cyrozap/usb-to-pcie-re](https://github.com/cyrozap/usb-to-pcie-re) -- the definitive ASMedia firmware reverse engineering source.
+
+---
+
+## 4. CDB Byte Layout
+
+Getting the byte positions right is critical. The ASMedia vendor CDB format does not follow the patterns of standard SCSI CDBs, and early implementations (including ours) had bytes in the wrong positions.
+
+### 0xE4 XDATA Read (6 bytes)
+
+Reads 1-255 bytes from a 16-bit XRAM address. Data is returned in the SCSI data-in phase.
+
+```
++--------+--------+--------+----------+----------+--------+
+| 0xE4   | length | 0x00   | addr_hi  | addr_lo  | 0x00   |
++--------+--------+--------+----------+----------+--------+
+  Byte 0   Byte 1   Byte 2   Byte 3     Byte 4    Byte 5
+  opcode   1-255    padding  addr>>8    addr&0xFF  padding
+```
+
+- **Byte 1**: Number of bytes to read (1-255). Zero is invalid.
+- **Bytes 3-4**: 16-bit XRAM address, big-endian (high byte first).
+- **Direction**: `SG_DXFER_FROM_DEV` (-3). Allocate a receive buffer of `length` bytes.
+
+Example: Read 64 bytes from XRAM address 0xB000:
+
+```
+CDB: E4 40 00 B0 00 00
+     ^  ^     ^  ^
+     |  |     |  +-- addr low = 0x00
+     |  |     +----- addr high = 0xB0
+     |  +----------- length = 64 (0x40)
+     +--------------- opcode
+```
+
+Using `sg_raw`:
+
+```bash
+sudo sg_raw -r 64 /dev/sdX E4 40 00 B0 00 00
+```
+
+### 0xE5 XDATA Write (6 bytes)
+
+Writes a single byte to a 16-bit XRAM address. The byte value is embedded directly in the CDB -- there is no SCSI data-out phase.
+
+```
++--------+--------+--------+----------+----------+--------+
+| 0xE5   | value  | 0x00   | addr_hi  | addr_lo  | 0x00   |
++--------+--------+--------+----------+----------+--------+
+  Byte 0   Byte 1   Byte 2   Byte 3     Byte 4    Byte 5
+  opcode   0x00-FF  padding  addr>>8    addr&0xFF  padding
+```
+
+- **Byte 1**: The byte value to write (0x00-0xFF).
+- **Bytes 3-4**: 16-bit XRAM address, big-endian.
+- **Direction**: `SG_DXFER_NONE` (-1). No data buffer.
+
+Example: Write 0xAB to XRAM address 0xB042:
+
+```
+CDB: E5 AB 00 B0 42 00
+     ^  ^     ^  ^
+     |  |     |  +-- addr low = 0x42
+     |  |     +----- addr high = 0xB0
+     |  +----------- value = 0xAB
+     +--------------- opcode
+```
+
+**Critical limitation**: One byte per SCSI command. Writing a 64-byte NVMe Submission Queue entry requires 64 individual 0xE5 commands. This is slow but reliable.
+
+### 0xE8 Reset (12 bytes)
+
+Resets the bridge controller. Two modes available.
+
+```
++--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+
+| 0xE8   | type   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   | 0x00   |
++--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+--------+
+  Byte 0   Byte 1   Bytes 2-11 (all zero)
+  opcode   0x00/0x01
+```
+
+- **Byte 1 = 0x00**: CPU reset. Full 8051 core restart. The USB device disconnects and re-enumerates. This forces the NVMe controller to re-initialize, which is necessary after sanitize operations.
+- **Byte 1 = 0x01**: PCIe soft reset. Re-initializes the PCIe link to the NVMe controller without restarting the bridge CPU. USB connection may survive.
+- **Direction**: `SG_DXFER_NONE` (-1). No data buffer.
+
+> **Warning**: CPU reset (type=0x00) will cause a USB disconnect. Your `/dev/sdX` device node will disappear. The device will re-enumerate on a new path after a few seconds. PCIe reset (type=0x01) may also disconnect USB depending on timing and the NVMe controller's behavior.
+
+### Common Mistakes
+
+1. **Swapped address bytes**: The address is big-endian in bytes 3-4, not little-endian. XRAM 0xB000 is `B0 00`, not `00 B0`.
+2. **Using a data buffer with 0xE5**: The write value is in the CDB itself. Sending a data-out buffer will cause undefined behavior.
+3. **Length=0 with 0xE4**: Invalid. Minimum read is 1 byte, maximum is 255.
+4. **Wrong CDB length**: 0xE4 and 0xE5 are 6-byte CDBs. 0xE8 is 12 bytes. Sending the wrong length causes SCSI errors.
+
+---
+
+## 5. XRAM Memory Map
+
+The ASM2362's 8051-compatible CPU has a 64KB external data memory (XRAM) address space from 0x0000 to 0xFFFF. The entire space is readable via 0xE4, though many regions return zeros or uninitialized data. The meaningful regions, verified through extensive probing, are:
+
+| Address Range | Size | Contents | Access | Notes |
+|---------------|------|----------|--------|-------|
+| 0x0000-0x07FF | 2KB | Firmware data/version | Read-only | FW version at 0x07F0 |
+| 0x8000-0x8FFF | 4KB | Cached data buffer | Read | Previous command responses |
+| 0x9000-0x9FFF | 4KB | Bridge control registers | Read | USB/SCSI state |
+| 0xA000-0xAFFF | 4KB | NVMe I/O Submission Queue | Read/Write | SQID=1, runtime I/O commands |
+| 0xB000-0xB0FF | 256B | **NVMe Admin SQ** (4 entries) | **Read/Write** | SQID=0, **injection target** |
+| 0xB200-0xB296 | ~150B | PCIe MMIO / TLP registers | Read/Write | Doorbell mechanism |
+| 0xB800-0xB9FF | 512B | I/O Completion Queue | Read | SQID=1 completions |
+| 0xBC00-0xBC7F | 128B | **Admin Completion Queue** | Read | SQID=0, 8 x 16-byte entries |
+| 0xF000-0xFFFF | 4KB | NVMe data buffer | Read | Identify/Log data cached here |
+
+### Key Details
+
+**Admin SQ at 0xB000**: This is the primary injection target. The queue holds 4 entries (not 8 -- this is a critical detail). Each entry is 64 bytes, so the valid range is 0xB000-0xB0FF. Slots 0-3 are usable. The DMA base address for this queue is 0x00800000.
+
+**Admin CQ at 0xBC00**: After injecting a command and ringing the doorbell, completion entries appear here. Each CQ entry is 16 bytes. The queue holds 8 entries (0xBC00-0xBC7F). Note: this is NOT at 0xB800 as initially assumed -- that is the I/O Completion Queue.
+
+**PCIe TLP registers at 0xB200**: These registers control the TLP (Transaction Layer Packet) engine used to generate PCIe transactions, including the doorbell write that submits injected commands to the NVMe controller.
+
+**Firmware version at 0x07F0**: A 6-byte firmware identifier. For our test device: `19 05 02 81 16 00`.
+
+### Read Safety
+
+The entire 64KB XRAM space is safe to read via 0xE4. Unallocated regions return zeros. There are no side effects from reads.
+
+### Write Safety
+
+Write access is restricted to prevent accidental damage. The safe-to-write regions are:
+
+- **0xB000-0xB1FF**: Admin Submission Queue (the injection target)
+- **0xF000-0xFFFF**: Data buffer (useful for staged operations)
+
+Writing to the PCIe MMIO region (0xB200-0xB296) is necessary for the doorbell mechanism but must follow the exact sequence described in Section 7. Writing to other regions (bridge control registers, I/O queues) risks corrupting bridge state and causing a USB disconnect.
+
+---
+
+## 6. NVMe Admin Queue Structure
+
+Understanding the NVMe queue format is essential for crafting injection payloads.
+
+### Submission Queue Entry (64 bytes)
+
+Each NVMe Submission Queue Entry (SQE) is 64 bytes, composed of 16 DWORDs (32-bit words) in little-endian format:
+
+| Offset | DWORD | Field | Description |
+|--------|-------|-------|-------------|
+| 0x00 | CDW0 | Command Header | `OPC[7:0]`, `FUSE[9:8]`, `PSDT[15:14]`, `CID[31:16]` |
+| 0x04 | CDW1 | NSID | Namespace Identifier |
+| 0x08 | CDW2 | Reserved | Must be zero |
+| 0x0C | CDW3 | Reserved | Must be zero |
+| 0x10 | CDW4 | MPTR Low | Metadata Pointer (low 32 bits) |
+| 0x14 | CDW5 | MPTR High | Metadata Pointer (high 32 bits) |
+| 0x18 | CDW6 | PRP1 Low | PRP Entry 1 (low 32 bits) |
+| 0x1C | CDW7 | PRP1 High | PRP Entry 1 (high 32 bits) |
+| 0x20 | CDW8 | PRP2 Low | PRP Entry 2 (low 32 bits) |
+| 0x24 | CDW9 | PRP2 High | PRP Entry 2 (high 32 bits) |
+| 0x28 | CDW10 | Command-specific | Varies by opcode |
+| 0x2C | CDW11 | Command-specific | Varies by opcode |
+| 0x30 | CDW12 | Command-specific | Varies by opcode |
+| 0x34 | CDW13 | Command-specific | Varies by opcode |
+| 0x38 | CDW14 | Command-specific | Varies by opcode |
+| 0x3C | CDW15 | Command-specific | Varies by opcode |
+
+**CDW0 encoding**: The opcode occupies the low 8 bits. The Command ID (CID) occupies bits 31:16. CID is used to correlate submissions with completions in the CQ.
+
+Example: Format NVM (OPC=0x80) with CID=0x0100:
+
+```
+CDW0 = 0x01000080
+       ^^^^  ^^
+       CID   OPC
+```
+
+In memory (little-endian): `80 00 00 01`
+
+**PRP fields**: For commands that do not transfer data (Format, Sanitize), PRP1 and PRP2 should be zero. For commands that return data (Identify, Get Log), PRP1 must point to a valid DMA buffer. When injecting via XRAM, the bridge firmware manages DMA buffers internally at 0xF000, so PRP fields can generally be left at zero for non-data admin commands.
+
+### Completion Queue Entry (16 bytes)
+
+Each NVMe Completion Queue Entry (CQE) is 16 bytes:
+
+| Offset | DWORD | Field | Description |
+|--------|-------|-------|-------------|
+| 0x00 | DW0 | Command Specific | Result value (command-dependent) |
+| 0x04 | DW1 | Reserved | |
+| 0x08 | DW2 | SQHD / SQID | `SQHD[15:0]` SQ Head Pointer, `SQID[31:16]` SQ Identifier |
+| 0x0C | DW3 | Status / CID | `CID[15:0]`, `P[16]` Phase Tag, `SF[31:17]` Status Field |
+
+**Status Field decoding** (DW3 bits 31:17):
+
+| Bits | Field | Description |
+|------|-------|-------------|
+| 17 | DNR | Do Not Retry |
+| 18 | M | More |
+| 24:19 | SC | Status Code |
+| 27:25 | SCT | Status Code Type |
+| 30:28 | CRD | Command Retry Delay |
+
+**Phase Tag (bit 16 of DW3)**: The NVMe controller toggles this bit each time it wraps around the CQ. Software uses it to determine which CQ entries are new. On the first pass through the queue, valid entries have P=1.
+
+### Queue Depth and Wrapping
+
+The Admin SQ on the ASM2362 has a depth of **4 entries** (slots 0-3). This was determined empirically -- initial assumptions of 8 entries were wrong, and writing to slots 4-7 produced no effect because those addresses are outside the queue boundary as configured by the bridge firmware.
+
+The Admin CQ has a depth of **8 entries**. After the controller processes a command, it writes a CQE to the next available slot and advances its internal CQ tail.
+
+The SQ Head Pointer (SQHD) in CQ entries tells you which SQ slot the controller last consumed. This is essential for knowing which slots are free for injection.
+
+---
+
+## 7. PCIe TLP Doorbell Mechanism
+
+After writing an NVMe command into the Admin SQ via XRAM, you need to notify the NVMe controller that a new command is waiting. In native NVMe, this is done by writing the new tail index to the SQ Tail Doorbell register in the controller's BAR0 memory space. Since we are operating through a USB bridge, we cannot directly access PCIe MMIO. Instead, we use the ASM2362's built-in TLP (Transaction Layer Packet) engine to generate a PCIe memory write on our behalf.
+
+This mechanism was reverse-engineered by cyrozap and documented in the `pcie_gen_req()` function of [usb-to-pcie-re](https://github.com/cyrozap/usb-to-pcie-re).
+
+### Step 1: Read BAR0
+
+First, determine the NVMe controller's BAR0 address via a PCIe Type 1 Configuration Read:
+
+```
+Config address: (bus=1 << 24) | (dev=0 << 19) | (fn=0 << 16) | offset=0x10
+= 0x01000010
+
+TLP format type: 0x05 (Type 1 Configuration Read)
+```
+
+The result is the raw BAR0 register value. Mask off the lower 4 bits (type indicator) to get the base address.
+
+For our test device: BAR0 = `0x00D00000`.
+
+### Step 2: Calculate Doorbell Address
+
+The NVMe Admin SQ Tail Doorbell is at BAR0 + 0x1000:
+
+```
+Doorbell address = 0x00D00000 + 0x1000 = 0x00D01000
+```
+
+The 0x1000 offset comes from the NVMe specification: doorbell stride is 4 bytes, Admin SQ Tail Doorbell is doorbell register 0, and the doorbell base is BAR0 + 0x1000.
+
+### Step 3: Write Data to TLP Data Register
+
+Write the new SQ tail value (the index of the next slot after your injected command) to `PCIE_TLP_DATA` at XRAM 0xB220. The value must be written as a 32-bit big-endian integer via four 0xE5 commands:
+
+```
+New tail = 1 (if command was placed in slot 0)
+
+Write sequence:
+  0xB220 <- 0x00  (byte 3, MSB)
+  0xB221 <- 0x00  (byte 2)
+  0xB222 <- 0x00  (byte 1)
+  0xB223 <- 0x01  (byte 0, LSB)
+```
+
+### Step 4: Write TLP Header
+
+The TLP header is 12 bytes (three big-endian 32-bit words) at XRAM 0xB210:
+
+```
+DW0 (0xB210): 0x40000001
+              ^^        ^
+              ||        +-- Length = 1 DWORD
+              |+----------- Reserved
+              +------------ Fmt/Type = 0x40 (Memory Write, 32-bit address, with data)
+
+DW1 (0xB214): byte_enable
+              Calculated as: ((1 << size) - 1) << offset
+              For a full 4-byte write at aligned address: 0x0000000F
+
+DW2 (0xB218): masked_address
+              Doorbell address with low 2 bits cleared: 0x00D01000
+```
+
+Each DWORD is written via four 0xE5 commands (big-endian byte order).
+
+### Step 5: Clear Timeout Bit
+
+Write 0x01 to `PCIE_CSR` at XRAM 0xB296:
+
+```
+0xB296 <- 0x01  (clear timeout flag)
+```
+
+### Step 6: Trigger TLP Generation
+
+Write 0x0F to `PCIE_OP` at XRAM 0xB254:
+
+```
+0xB254 <- 0x0F  (trigger PCIe operation)
+```
+
+### Step 7: Poll for Ready
+
+Read `PCIE_CSR` at 0xB296 repeatedly until bit 2 (ready) is set:
+
+```
+while (read(0xB296) & 0x04 == 0):
+    continue
+```
+
+This typically completes within a few reads.
+
+### Step 8: Send TLP
+
+Write 0x04 to `PCIE_CSR` to dispatch the TLP packet:
+
+```
+0xB296 <- 0x04  (send TLP)
+```
+
+For a posted memory write (which doorbell writes are), there is no completion to wait for. The TLP is fire-and-forget. The NVMe controller will process the doorbell write and begin executing the command in the SQ slot indicated by the new tail value.
+
+### TLP Header Format Summary
+
+```
+DW0: [fmt_type:8][reserved:16][length:8]
+     fmt_type = 0x40 for posted memory write (32-bit addr, with data)
+     fmt_type = 0x05 for Type 1 config read
+     length = 1 (one DWORD of data)
+
+DW1: [byte_enable:32]
+     0x0000000F for full 4-byte access at aligned address
+
+DW2: [address:32]
+     PCIe address with bits [1:0] cleared
+```
+
+### Important Limitations
+
+- **PCIe Memory READS do not work** through this TLP engine. Attempting a memory read (fmt_type=0x00) will hang or timeout. Only PCIe Configuration Reads (fmt_type=0x04/0x05) and Posted Memory Writes (fmt_type=0x40) are reliable.
+- **Config reads** are non-posted (require a completion TLP). The code polls `PCIE_CSR` bit 1 for completion and reads the result from `PCIE_TLP_DATA`.
+
+### Why Not Use 0xE8 PCIe Reset?
+
+The 0xE8 Reset command (type=0x01, PCIe soft reset) was our initial doorbell mechanism. It works by resetting the entire PCIe link, which forces the NVMe controller to re-process its submission queues. However, it has a fatal flaw: the USB connection drops during PCIe reset, making it impossible to read the Admin CQ for completion status. The TLP doorbell approach keeps USB alive throughout.
+
+---
+
+## 8. Injection Workflow
+
+The complete XRAM injection process has six phases. Each phase is verified before proceeding to the next.
+
+### Phase 1: Read Admin SQ State
+
+Read 256 bytes from XRAM 0xB000-0xB0FF (four 64-byte entries):
+
+```bash
+# Using the tool:
+sudo asm2362-tool xram-dump --addr=0xB000 --len=256 /dev/sdX
+
+# Using sg_raw (first 64 bytes):
+sudo sg_raw -r 64 /dev/sdX E4 40 00 B0 00 00
+```
+
+Parse each 64-byte entry to identify which slots are occupied (CDW0 != 0) and which are empty. A freshly initialized Admin SQ typically has firmware-placed commands in slots 0-3 (Set Features, Create I/O CQ, Create I/O SQ). After the controller consumes them, the slots may still contain stale data -- check the CQ's SQHD to determine which slots are actually free.
+
+### Phase 2: Choose a Slot
+
+Select a slot to write your command into. The queue depth is 4 (slots 0-3 only). If the queue appears full, the controller may have already consumed entries -- check SQHD in the last CQ entry to confirm.
+
+In practice, after initial boot-up, the bridge firmware initializes the Admin SQ and the controller consumes all entries quickly. Slot 0 is typically available for injection.
+
+```
+Available slots: 0-3 (ADMIN_SQ depth = 4)
+Slot XRAM addresses:
+  Slot 0: 0xB000-0xB03F
+  Slot 1: 0xB040-0xB07F
+  Slot 2: 0xB080-0xB0BF
+  Slot 3: 0xB0C0-0xB0FF
+```
+
+### Phase 3: Write 64 Bytes via 0xE5
+
+Serialize the NVMe SQE to 64 little-endian bytes and write them one at a time:
+
+```bash
+# Writing a Sanitize Block Erase command to slot 0:
+# CDW0 = 0x42420084 -> bytes: 84 00 42 42 (little-endian)
+# NSID = 0x00000000 -> bytes: 00 00 00 00
+# CDW10 = 0x00000002 -> at offset 40: 02 00 00 00
+# All other bytes = 0x00
+
+# Byte 0 of slot 0 (address 0xB000):
+sudo sg_raw /dev/sdX E5 84 00 B0 00 00
+
+# Byte 1 of slot 0 (address 0xB001):
+sudo sg_raw /dev/sdX E5 00 00 B0 01 00
+
+# ... continue for all 64 bytes ...
+
+# Byte 40 of slot 0 (CDW10 low byte, address 0xB028):
+sudo sg_raw /dev/sdX E5 02 00 B0 28 00
+```
+
+This requires 64 individual SCSI commands. Using the Zig tool, this takes approximately 2-3 seconds. Using `sg_raw` in a shell loop, expect 5-10 seconds.
+
+### Phase 4: Readback Verification
+
+Read back the 64 bytes from the slot and compare against the expected values:
+
+```bash
+sudo sg_raw -r 64 /dev/sdX E4 40 00 B0 00 00
+```
+
+Compare every byte. If even one byte differs, do NOT ring the doorbell. A malformed NVMe command could crash the controller or cause undefined behavior.
+
+### Phase 5: Ring the Doorbell
+
+Execute the PCIe TLP doorbell sequence described in Section 7. The new tail value should be `slot + 1`:
+
+- Command in slot 0: ring with tail = 1
+- Command in slot 1: ring with tail = 2
+- Command in slot 3: ring with tail = 0 (wraps around for queue depth 4)
+
+Using the tool:
+
+```bash
+# Dry run (writes to SQ but does NOT ring doorbell):
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --dry-run /dev/sdX
+
+# Live execution:
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --force /dev/sdX
+```
+
+After ringing the doorbell, the NVMe controller will fetch the command from the SQ slot and begin execution.
+
+### Phase 6: Check Admin CQ
+
+Read the Admin Completion Queue at XRAM 0xBC00-0xBC7F to find the completion entry matching your CID:
+
+```bash
+sudo asm2362-tool admin-cq /dev/sdX
+
+# Or manually:
+sudo sg_raw -r 128 /dev/sdX E4 80 00 BC 00 00
+```
+
+Parse each 16-byte CQE. Look for your CID (0x4242 in the example) in DW3 bits [15:0]. The status field in DW3 bits [31:17] tells you whether the command succeeded:
+
+- **Status = 0x0000**: Success (Generic Command Status, No Error)
+- **Status = 0x0002**: Invalid Field in Command
+- **Status = 0x000B**: Invalid Namespace or Format
+- **Status = 0x8001**: Feature Not Saveable
+
+---
+
+## 9. Crafting NVMe Commands
+
+Below are complete NVMe SQE specifications for the most commonly injected commands. All multi-byte values are in little-endian when written to XRAM.
+
+### Sanitize -- Block Erase (Opcode 0x84)
+
+The command that successfully recovered our test drive. Block Erase instructs the controller to erase all user data blocks, resetting the FTL.
+
+```
+Offset  DWORD   Value         Description
+0x00    CDW0    0x42420084    OPC=0x84 (Sanitize), CID=0x4242
+0x04    NSID    0x00000000    Sanitize is a controller-level command (NSID=0)
+0x08    --      0x00000000    Reserved
+0x0C    --      0x00000000    Reserved
+0x10    MPTR    0x00000000    No metadata
+0x14    MPTR    0x00000000
+0x18    PRP1    0x00000000    No data transfer
+0x1C    PRP1    0x00000000
+0x20    PRP2    0x00000000
+0x24    PRP2    0x00000000
+0x28    CDW10   0x00000002    SANACT=2 (Block Erase)
+0x2C    CDW11   0x00000000
+0x30    CDW12   0x00000000
+0x34    CDW13   0x00000000
+0x38    CDW14   0x00000000
+0x3C    CDW15   0x00000000
+```
+
+CDW10 SANACT values:
+- 1 = Exit Failure Mode
+- 2 = Block Erase
+- 3 = Overwrite
+- 4 = Crypto Erase
+
+> **Important**: Check SANICAP (Sanitize Capabilities) in the Identify Controller data before choosing SANACT. Our PS5012-E12 reported SANICAP=0x00000002, meaning only Block Erase is supported. Attempting Crypto Erase (SANACT=4) on a controller that does not support it returns an error.
+
+### Format NVM (Opcode 0x80)
+
+Reformats the NVMe namespace. In our testing, this was accepted by the controller but did not clear the FTL write protection -- Sanitize was required instead.
+
+```
+Offset  DWORD   Value         Description
+0x00    CDW0    0x01000080    OPC=0x80 (Format NVM), CID=0x0100
+0x04    NSID    0xFFFFFFFF    All namespaces
+0x08-0x27       0x00...       Reserved, MPTR, PRP (all zero)
+0x28    CDW10   0x00000200    LBAF=0 (bits 3:0), SES=1 (bits 11:9)
+0x2C-0x3C       0x00...       Remaining CDWs zero
+```
+
+CDW10 encoding:
+- Bits [3:0] LBAF: LBA Format index (0 = default 512B sectors)
+- Bits [8:4] MS: Metadata Settings
+- Bits [11:9] SES: Secure Erase Settings
+  - 0 = No secure erase
+  - 1 = User Data Erase
+  - 2 = Cryptographic Erase
+
+### Set Features -- Clear Write Protect (Opcode 0x09)
+
+Attempts to clear namespace write protection via Feature ID 0x84.
+
+```
+Offset  DWORD   Value         Description
+0x00    CDW0    0x01000009    OPC=0x09 (Set Features), CID=0x0100
+0x04    NSID    0x00000001    Namespace 1
+0x08-0x27       0x00...       Reserved, MPTR, PRP (all zero)
+0x28    CDW10   0x00000084    FID=0x84 (Namespace Write Protect Config)
+0x2C    CDW11   0x00000000    Value=0 (No Write Protect)
+0x30-0x3C       0x00...       Remaining CDWs zero
+```
+
+CDW10 encoding:
+- Bits [7:0] FID: Feature Identifier (0x84 = Namespace Write Protection)
+- Bit [31] SV: Save (1 = persist across power cycles)
+
+CDW11 encoding:
+- 0x00 = No Write Protect
+- 0x01 = Write Protect
+- 0x02 = Write Protect Until Power Cycle
+- 0x03 = Permanent Write Protect
+
+> **Note**: On our PS5012-E12, the read-only condition was NOT caused by Feature 0x84 (SMART Critical Warning bit 3 was also not set). The root cause was internal FTL corruption. Set Features 0x84 is included here for completeness -- it addresses a different write protection mechanism.
+
+### Security Send (Opcode 0x82)
+
+Used for TCG Opal or ATA Security Protocol operations.
+
+```
+Offset  DWORD   Value         Description
+0x00    CDW0    0x01000082    OPC=0x82 (Security Send), CID=0x0100
+0x04    NSID    0x00000000    Controller-level command
+0x08-0x27       0x00...       Reserved, MPTR, PRP
+0x28    CDW10   0xEF000100    SECP=0xEF (ATA), SPSP=0x0001, TL in CDW11
+0x2C    CDW11   0x00000024    Transfer Length (36 bytes for ATA password)
+0x30-0x3C       0x00...       Remaining CDWs zero
+```
+
+CDW10 encoding:
+- Bits [7:0] SECP: Security Protocol (0xEF = ATA Device Server Password)
+- Bits [23:8] SPSP: Security Protocol Specific
+- Bits [31:24] NSSF: NVMe Security Specific Field
+
+> **Warning**: Security Send with incorrect parameters can lock a drive permanently. If you set an ATA password incorrectly, the drive may become inaccessible. Only use this command if you know exactly what you are doing.
+
+---
+
+## 10. Verifying Results
+
+### Reading Admin CQ Entries
+
+After ringing the doorbell, the NVMe controller writes completion entries to the Admin CQ at XRAM 0xBC00. Read and parse them:
+
+```bash
+# Read all 8 Admin CQ entries (128 bytes)
+sudo sg_raw -r 128 /dev/sdX E4 80 00 BC 00 00
+```
+
+Each 16-byte entry:
+
+```
+Bytes 0-3:   DW0 -- Command-specific result
+Bytes 4-7:   DW1 -- Reserved
+Bytes 8-9:   SQHD (SQ Head Pointer, consumed index)
+Bytes 10-11: SQID (should be 0 for Admin SQ)
+Bytes 12-13: CID  (matches your injected CID)
+Bytes 14-15: Status/Phase
+```
+
+Match entries by CID. For CID=0x4242, look for `42 42` at offset 12-13 within a CQ entry.
+
+### NVMe Status Code Decoding
+
+Common status codes (DW3 bits 31:17, after extracting SCT and SC):
+
+| SCT | SC | Meaning |
+|-----|-----|---------|
+| 0x0 | 0x00 | Successful Completion |
+| 0x0 | 0x01 | Invalid Command Opcode |
+| 0x0 | 0x02 | Invalid Field in Command |
+| 0x0 | 0x04 | Command ID Conflict |
+| 0x0 | 0x06 | Internal Error |
+| 0x0 | 0x0B | Invalid Namespace or Format |
+| 0x0 | 0x0D | Invalid Number of SGL/PRP Entries |
+| 0x1 | 0x02 | Namespace Not Ready |
+| 0x1 | 0x04 | Format In Progress |
+| 0x1 | 0x0D | Sanitize In Progress |
+
+### Sanitize Status Log Page
+
+After a Sanitize command, check progress via Get Log Page (Log ID 0x81). This can be done through the standard 0xE6 passthrough since Get Log Page is on the whitelist:
+
+```bash
+sudo asm2362-tool smart /dev/sdX --json
+# Or via nvme-cli if the drive is accessible:
+# sudo nvme sanitize-log /dev/nvmeX
+```
+
+Sanitize Status (SSTAT) field values:
+- 0x0000: Never been sanitized
+- 0x0001: Most recent sanitize completed successfully
+- 0x0002: Sanitize in progress
+- 0x0003: Most recent sanitize failed
+- 0x0100: Most recent completed with Block Erase
+
+### SMART Critical Warning Bits
+
+The SMART/Health log (Log ID 0x02, byte 0) contains warning flags:
+
+| Bit | Mask | Meaning |
+|-----|------|---------|
+| 0 | 0x01 | Available spare below threshold |
+| 1 | 0x02 | Temperature exceeded threshold |
+| 2 | 0x04 | NVM subsystem reliability degraded |
+| 3 | 0x08 | Media placed in read-only mode |
+| 4 | 0x10 | Volatile memory backup failed |
+
+Bit 3 is often cited as the indicator for firmware-level read-only mode. However, in our case, SMART Critical Warning was 0x00 (no bits set) despite the drive being in read-only mode. The read-only condition was enforced by the FTL independently of the SMART status. Do not rely on bit 3 as a definitive diagnostic.
+
+### Post-Recovery Write Verification
+
+After sanitize and bridge reset, verify write capability:
+
+```bash
+# Write random data
+sudo dd if=/dev/urandom of=/dev/sdX bs=1M count=1 oflag=direct
+
+# Read it back and verify
+sudo dd if=/dev/sdX bs=1M count=1 | md5sum
+sudo dd if=/dev/urandom of=/tmp/testdata bs=1M count=1
+sudo dd if=/tmp/testdata of=/dev/sdX bs=1M count=1 oflag=direct conv=fsync
+sudo dd if=/dev/sdX bs=1M count=1 | md5sum
+md5sum /tmp/testdata  # Should match
+```
+
+---
+
+## 11. Common Pitfalls
+
+A numbered list of issues encountered during development and testing, presented in order of likelihood:
+
+1. **UAS mode silently fails for vendor commands.** Under UAS, 0xE4/0xE5/0xE8 return `host_status=0x07` (`DID_ERROR`, errno -75 `EOVERFLOW`). The error message may be cryptic. Always switch to BOT mode first. This is the single most common reason for "XRAM access doesn't work."
+
+2. **CDB byte order is NOT what you would expect from the opcode name.** The 0xE4/0xE5 CDBs put the value/length at byte 1 and the address at bytes 3-4, with padding at bytes 2 and 5. This does not match the conventional SCSI CDB layout where the address comes before the transfer parameter. Getting this wrong produces reads from the wrong address or writes to the wrong location -- potentially corrupting bridge state.
+
+3. **Admin SQ depth is 4, not 8.** The XRAM region from 0xB000-0xB1FF has space for 8 entries (512 bytes / 64 bytes = 8 slots), but the bridge firmware configures the NVMe Admin SQ with a depth of only 4. Writing commands to slots 4-7 has no effect because the NVMe controller's SQ tail doorbell wraps at depth 4. Our early injection attempts wrote to slot 4 and saw no CQ completion -- this wasted significant debugging time.
+
+4. **SANICAP must be checked before sanitize.** The Sanitize Capabilities (SANICAP) field in the Identify Controller data indicates which sanitize actions the controller supports. Our PS5012-E12 had SANICAP=0x00000002 (Block Erase only). Attempting Crypto Erase (SANACT=4) returned an error. Always read Identify Controller via 0xE6 passthrough and check SANICAP before crafting a Sanitize command.
+
+5. **PCIe memory reads hang.** The ASM2362's TLP engine can generate PCIe Configuration Reads and Posted Memory Writes, but not Memory Reads. Attempting a memory read TLP (fmt_type=0x00 with no data) causes a timeout. This means you cannot read BAR0 registers directly -- only write to them (e.g., doorbells). Use Configuration Reads (fmt_type=0x04/0x05) to read PCIe config space, including BAR0.
+
+6. **Bridge firmware may zero consumed CQ entries.** After reading a CQ entry, the bridge firmware may clear it on subsequent reads. Capture CQ data on the first read after ringing the doorbell. Do not assume CQ entries persist indefinitely.
+
+7. **CPU reset (0xE8 type=0) disconnects USB.** If you need to force the NVMe controller to re-initialize (e.g., after sanitize), use CPU reset -- but be prepared for the device to disappear. You will need to wait for USB re-enumeration and find the new `/dev/sdX` path. The TLP doorbell, by contrast, keeps USB alive.
+
+8. **0xE5 writes one byte at a time.** There is no bulk XRAM write command. Writing 64 bytes requires 64 individual SCSI commands. This is slow (~50ms per command, 3+ seconds for a full SQE). Do not try to speed this up by overlapping commands -- the bridge processes them sequentially.
+
+9. **NVMe commands may appear to succeed but have no effect.** The controller can return a successful completion status for Format NVM while the FTL remains in write-protected mode. Success in the CQ means the command was syntactically valid and accepted -- not necessarily that it achieved the desired result. Always verify the actual outcome (e.g., test writes) after any recovery command.
+
+10. **0xE6 passthrough gives false confidence.** The 0xE6 passthrough returns SCSI Good status for ALL NVMe opcodes, even ones blocked by the firmware whitelist. The command simply never reaches the NVMe controller. This makes it appear as though the NVMe controller is rejecting the command, when in reality the bridge is silently dropping it. If Identify and Get Log Page work but Format and Sanitize "fail silently," the whitelist is the cause.
+
+---
+
+## 12. Tool Reference
+
+The `asm2362-tool` implements all operations described in this guide. Build it with Zig 0.13.0+:
+
+```bash
+zig build
+```
+
+### Command Summary
+
+```bash
+# Bridge detection and identification
+sudo asm2362-tool probe /dev/sdX
+
+# NVMe controller identification (via 0xE6 passthrough)
+sudo asm2362-tool identify /dev/sdX
+
+# SMART/Health log (via 0xE6 passthrough)
+sudo asm2362-tool smart /dev/sdX --json
+
+# XRAM probe (safe, read-only -- dumps Admin SQ, MMIO, data buffer)
+sudo asm2362-tool xram-probe /dev/sdX
+
+# Raw XRAM read
+sudo asm2362-tool xram-read --addr=0xB000 --len=64 /dev/sdX
+
+# Raw XRAM hex dump
+sudo asm2362-tool xram-dump --addr=0xB000 --len=512 /dev/sdX
+
+# Raw XRAM single-byte write
+sudo asm2362-tool xram-write --addr=0xB000 --byte=0x00 /dev/sdX
+
+# Admin CQ dump
+sudo asm2362-tool admin-cq /dev/sdX
+
+# NVMe command injection (dry run -- writes SQ but does NOT ring doorbell)
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --dry-run /dev/sdX
+
+# NVMe command injection (LIVE -- rings doorbell, executes command)
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --force /dev/sdX
+
+# Bridge reset
+sudo asm2362-tool reset --reset-type=0 /dev/sdX  # CPU reset (USB disconnects)
+sudo asm2362-tool reset --reset-type=1 /dev/sdX  # PCIe soft reset
+```
+
+### Inject Command Options
+
+| Command | NVMe Opcode | Description |
+|---------|-------------|-------------|
+| `format` | 0x80 | Format NVM with SES=1 (User Data Erase) |
+| `sanitize-block` | 0x84 | Sanitize Block Erase (SANACT=2) |
+| `sanitize-crypto` | 0x84 | Sanitize Crypto Erase (SANACT=4) |
+| `clear-wp` | 0x09 | Set Features FID=0x84, value=0 (No Write Protect) |
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--slot=N` | Admin SQ slot (0-3). Default: auto-detect first empty. |
+| `--tail=N` | Doorbell tail value. Default: slot+1. |
+| `--cid=0xNNNN` | Command ID for CQ correlation. Default: 0x0100. |
+| `--nsid=N` | Namespace ID. Default: 0xFFFFFFFF (all namespaces). |
+| `--force` | Required for live (non-dry-run) execution. |
+| `--dry-run` | Write to SQ but skip doorbell ring. |
+
+### Proven Recovery Sequence
+
+The exact commands that recovered our PS5012-E12:
+
+```bash
+# 0. Switch to BOT mode
+sudo bash -c '
+  echo "1-3" > /sys/bus/usb/drivers/usb/unbind
+  rmmod uas; rmmod usb_storage
+  modprobe usb-storage quirks=174c:2362:u
+  echo "1-3" > /sys/bus/usb/drivers/usb/bind
+'
+
+# 1. Verify bridge and controller
+sudo asm2362-tool probe /dev/sdX
+sudo asm2362-tool identify /dev/sdX
+
+# 2. Check Admin SQ and CQ state
+sudo asm2362-tool xram-probe /dev/sdX
+sudo asm2362-tool admin-cq /dev/sdX
+
+# 3. Dry run injection (verify before committing)
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --dry-run /dev/sdX
+
+# 4. Live injection
+sudo asm2362-tool inject --inject-cmd=sanitize-block \
+  --slot=0 --tail=1 --cid=0x4242 --force /dev/sdX
+
+# 5. Check completion
+sudo asm2362-tool admin-cq /dev/sdX
+
+# 6. CPU reset to re-initialize NVMe controller
+sudo asm2362-tool reset --reset-type=0 /dev/sdX
+
+# 7. Wait for re-enumeration, find new device path
+sleep 5
+lsblk
+
+# 8. Verify writes work
+sudo dd if=/dev/urandom of=/dev/sdY bs=1M count=1 oflag=direct conv=fsync
+sudo dd if=/dev/sdY bs=1M count=1 | md5sum
+```
+
+---
+
+## 13. References
+
+### Primary Sources
+
+- **cyrozap/usb-to-pcie-re**: [https://github.com/cyrozap/usb-to-pcie-re](https://github.com/cyrozap/usb-to-pcie-re) -- ASMedia USB bridge firmware reverse engineering. The definitive reference for ASM236x XRAM layout, vendor SCSI commands, PCIe TLP generation, and the 0xE6 passthrough whitelist. The `asm2x6x_tool.py` script implements all operations described in this guide in Python.
+
+- **NVMe Base Specification 2.0**: [https://nvmexpress.org/specifications/](https://nvmexpress.org/specifications/) -- Section 3.3.3 (Submission Queue Entry), Section 4.2 (Submission Queue and Completion Queue Definition), Section 5.14 (Format NVM), Section 5.15 (Sanitize), Section 5.27 (Set Features).
+
+- **smartmontools**: [https://github.com/smartmontools/smartmontools](https://github.com/smartmontools/smartmontools) -- The `scsinvme.cpp` file contains the `sntasmedia_device` class, a reference implementation of the 0xE6 passthrough for Identify and SMART retrieval.
+
+### Additional References
+
+- **smx-smx/ASMTool**: [https://github.com/smx-smx/ASMTool](https://github.com/smx-smx/ASMTool) -- ASMedia firmware dumper and analysis tool.
+
+- **sg3_utils**: [https://sg.danny.cz/sg/sg3_utils.html](https://sg.danny.cz/sg/sg3_utils.html) -- The `sg_raw` utility is invaluable for manual SCSI command testing during development.
+
+- **NVMe SMART Critical Warning**: NVMe Base Specification 2.0, Section 5.14.1.2 -- Documents the Critical Warning byte and bit 3 (media placed in read-only mode).
+
+- **Phison PS5012-E12**: Datasheet not publicly available. Key parameters discovered empirically: OACS=0x0006, SANICAP=0x00000002, VID=0x1E4B, firmware H211011a.
+
+### ASM2362 Hardware Characteristics
+
+| Property | Value |
+|----------|-------|
+| CPU | 8051-compatible core, ~114.3 MHz |
+| XRAM | 64KB (0x0000-0xFFFF) |
+| USB | 3.1 Gen 2 (10 Gbps) |
+| PCIe | Gen 3 x2 (or x1 depending on variant) |
+| UART debug | 921600 8N1, 3.3V (pins 62/63) |
+| Firmware signing | None (unsigned firmware accepted) |
+
+---
+
+## Appendix A: XRAM Register Quick Reference
+
+### PCIe TLP Engine Registers
+
+| Address | Name | Width | Description |
+|---------|------|-------|-------------|
+| 0xB210 | PCIE_TLP_HEADER | 12 bytes | TLP request header (3 x u32 big-endian) |
+| 0xB220 | PCIE_TLP_DATA | 4 bytes | TLP write data (u32 big-endian) |
+| 0xB224 | PCIE_TLP_CPL | 12 bytes | TLP completion header |
+| 0xB254 | PCIE_OP | 1 byte | Operation trigger (write 0x0F to start) |
+| 0xB284 | PCIE_STATUS | 1 byte | Config request validation status |
+| 0xB296 | PCIE_CSR | 1 byte | Control/Status Register |
+
+### PCIE_CSR Bit Definitions (0xB296)
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 0 | TIMEOUT | Set on PCIe timeout; write 1 to clear |
+| 1 | CPL_DONE | Completion received (for non-posted transactions) |
+| 2 | READY | TLP engine ready; poll before sending |
+
+### Admin SQ Slot Addresses
+
+| Slot | XRAM Start | XRAM End | Bytes |
+|------|------------|----------|-------|
+| 0 | 0xB000 | 0xB03F | 64 |
+| 1 | 0xB040 | 0xB07F | 64 |
+| 2 | 0xB080 | 0xB0BF | 64 |
+| 3 | 0xB0C0 | 0xB0FF | 64 |
+
+### Admin CQ Entry Addresses
+
+| Entry | XRAM Start | XRAM End | Bytes |
+|-------|------------|----------|-------|
+| 0 | 0xBC00 | 0xBC0F | 16 |
+| 1 | 0xBC10 | 0xBC1F | 16 |
+| 2 | 0xBC20 | 0xBC2F | 16 |
+| 3 | 0xBC30 | 0xBC3F | 16 |
+| 4 | 0xBC40 | 0xBC4F | 16 |
+| 5 | 0xBC50 | 0xBC5F | 16 |
+| 6 | 0xBC60 | 0xBC6F | 16 |
+| 7 | 0xBC70 | 0xBC7F | 16 |
+
+---
+
+## Appendix B: Endianness Reference
+
+XRAM injection involves two different byte orders. Getting these confused will produce garbage commands.
+
+**NVMe SQE fields** are **little-endian** (as specified by NVMe Base Spec). When writing CDW0 = 0x42420084 to XRAM via 0xE5:
+
+```
+Address   Value   Description
+0xB000    0x84    CDW0 byte 0 (LSB) = opcode
+0xB001    0x00    CDW0 byte 1
+0xB002    0x42    CDW0 byte 2
+0xB003    0x42    CDW0 byte 3 (MSB) = CID high byte
+```
+
+**PCIe TLP header fields** are **big-endian** (as specified by PCIe Base Spec). When writing the TLP header DW0 = 0x40000001 to XRAM 0xB210:
+
+```
+Address   Value   Description
+0xB210    0x40    DW0 byte 0 (MSB) = fmt_type
+0xB211    0x00    DW0 byte 1
+0xB212    0x00    DW0 byte 2
+0xB213    0x01    DW0 byte 3 (LSB) = length
+```
+
+The XRAM addressing itself (in the 0xE4/0xE5 CDB bytes 3-4) is also big-endian: address 0xB000 is encoded as `B0 00`.

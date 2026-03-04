@@ -200,6 +200,7 @@ pub fn buildSmartLogCdb() [16]u8 {
 }
 
 /// Build CDB for NVMe Format NVM command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildFormatCdb(nsid: u32, lbaf: u4, ses: u3) [16]u8 {
     // CDW10: LBAF (bits 3:0), SES (bits 11:9)
     const cdw10: u32 = @as(u32, lbaf) | (@as(u32, ses) << 9);
@@ -207,6 +208,7 @@ pub fn buildFormatCdb(nsid: u32, lbaf: u4, ses: u3) [16]u8 {
 }
 
 /// Build CDB for NVMe Sanitize command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildSanitizeCdb(sanact: u3) [16]u8 {
     // CDW10: SANACT (bits 2:0)
     // 1 = Exit Failure Mode
@@ -330,6 +332,7 @@ pub const FeatureId = enum(u8) {
 
 /// Build CDB for NVMe Get Features command (0x0A)
 /// Returns current value of specified feature
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildGetFeaturesCdb(fid: u8, nsid: u32, sel: u2) [16]u8 {
     // CDW10: SEL (bits 10:8), FID (bits 7:0)
     // SEL: 0=Current, 1=Default, 2=Saved, 3=Supported Capabilities
@@ -339,6 +342,7 @@ pub fn buildGetFeaturesCdb(fid: u8, nsid: u32, sel: u2) [16]u8 {
 
 /// Build CDB for NVMe Set Features command (0x09)
 /// Sets the value of specified feature
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildSetFeaturesCdb(fid: u8, nsid: u32, cdw11: u32, save: bool) [16]u8 {
     // CDW10: SV (bit 31), FID (bits 7:0)
     // SV: Save - if set, feature persists across power cycles
@@ -352,6 +356,7 @@ pub fn buildSetFeaturesCdb(fid: u8, nsid: u32, cdw11: u32, save: bool) [16]u8 {
 
 /// Build CDB for NVMe Security Send command (0x81)
 /// Used for ATA security password and erase operations
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildSecuritySendCdb(protocol: u8, sp_specific: u16, transfer_len: u32) [16]u8 {
     // CDW10: Security Protocol (7:0), SP Specific (23:8), Reserved (31:24)
     const cdw10: u32 = @as(u32, protocol) | (@as(u32, sp_specific) << 8);
@@ -362,6 +367,7 @@ pub fn buildSecuritySendCdb(protocol: u8, sp_specific: u16, transfer_len: u32) [
 
 /// Build CDB for NVMe Security Receive command (0x82)
 /// Used to receive security data/status
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn buildSecurityRecvCdb(protocol: u8, sp_specific: u16, transfer_len: u32) [16]u8 {
     // CDW10: Security Protocol (7:0), SP Specific (23:8), Reserved (31:24)
     const cdw10: u32 = @as(u32, protocol) | (@as(u32, sp_specific) << 8);
@@ -371,6 +377,7 @@ pub fn buildSecurityRecvCdb(protocol: u8, sp_specific: u16, transfer_len: u32) [
 }
 
 /// Execute NVMe Security Send command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn securitySend(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -392,6 +399,7 @@ pub fn securitySend(
 }
 
 /// Execute NVMe Security Receive command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn securityRecv(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -412,6 +420,7 @@ pub fn securityRecv(
 
 /// Execute NVMe Get Features command
 /// Returns feature value in result data (4 bytes for simple features)
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn getFeatures(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -431,6 +440,7 @@ pub fn getFeatures(
 }
 
 /// Execute NVMe Set Features command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn setFeatures(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -452,6 +462,7 @@ pub fn setFeatures(
 
 /// Get Write Protect status for a namespace
 /// Returns true if write protection is enabled
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn getWriteProtectStatus(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -468,6 +479,7 @@ pub fn getWriteProtectStatus(
 
 /// Attempt to clear write protection on a namespace
 /// Note: This may not work if controller has locked the protection
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn clearWriteProtect(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -580,6 +592,7 @@ pub fn getSmartLog(
 }
 
 /// Execute NVMe Format NVM command
+/// NOTE: Blocked by ASM2362 firmware whitelist -- use XRAM injection (xram.zig) instead.
 pub fn formatNvm(
     allocator: std.mem.Allocator,
     device_path: []const u8,
@@ -660,11 +673,14 @@ test "build Get Features CDB" {
 
 test "build Get Features CDB with SEL" {
     // Get Write Protect feature, saved value (SEL=2)
+    // NOTE: SEL lives in CDW10[10:8] which maps to CDW10[15:8] — this byte range
+    // is NOT passed by the 0xe6 CDB format (only [7:0], [23:16], [31:24] are mapped).
+    // This is a known limitation: SEL is silently lost through the ASM2362 bridge.
     const cdb = buildGetFeaturesCdb(@intFromEnum(FeatureId.namespace_write_protect), 1, 2);
     try std.testing.expectEqual(@as(u8, 0xe6), cdb[0]); // ASMedia opcode
     try std.testing.expectEqual(@as(u8, 0x0A), cdb[1]); // NVMe Get Features opcode
     try std.testing.expectEqual(@as(u8, 0x84), cdb[3]); // FID=0x84 (Namespace Write Protect)
-    try std.testing.expectEqual(@as(u8, 0x02), cdb[6]); // SEL=2 in CDW10[10:8] -> byte 6 = CDW10[23:16]
+    try std.testing.expectEqual(@as(u8, 0x00), cdb[6]); // SEL=2 lost: CDW10[15:8] not mapped in 0xe6 CDB
 }
 
 test "build Set Features CDB" {

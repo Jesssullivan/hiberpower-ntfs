@@ -1,6 +1,9 @@
 # This file
 .gitignore
 
+# Project config (local only)
+CLAUDE.md
+
 # Zig build artifacts
 zig-out/
 zig-cache/

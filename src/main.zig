@@ -4,20 +4,20 @@
 //! to recover NVMe drives exhibiting silent write failure.
 //!
 //! Usage:
-//!   asm2362-tool probe /dev/sdX        - Probe device capabilities
-//!   asm2362-tool identify /dev/sdX     - Get NVMe identify data
-//!   asm2362-tool smart /dev/sdX        - Get SMART log
-//!   asm2362-tool format /dev/sdX       - Format NVM (destructive)
-//!   asm2362-tool replay <file> /dev/sdX - Replay captured commands
+//!   asm2362-tool probe /dev/sdX            - Probe device capabilities
+//!   asm2362-tool identify /dev/sdX         - Get NVMe identify data
+//!   asm2362-tool smart /dev/sdX            - Get SMART log
+//!   asm2362-tool xram-probe /dev/sdX       - Probe XRAM (safe, read-only)
+//!   asm2362-tool inject --dry-run /dev/sdX - Inject NVMe command via XRAM
+//!   asm2362-tool replay <file> /dev/sdX    - Replay captured commands
 
 const std = @import("std");
 const sg_io = @import("scsi/sg_io.zig");
 const sense = @import("scsi/sense.zig");
 const passthrough = @import("asm2362/passthrough.zig");
 const commands = @import("asm2362/commands.zig");
+const xram = @import("asm2362/xram.zig");
 const identify = @import("nvme/identify.zig");
-const format = @import("nvme/format.zig");
-const sanitize = @import("nvme/sanitize.zig");
 const probe = @import("analysis/probe.zig");
 const replay = @import("frida/replay.zig");
 
@@ -36,7 +36,22 @@ const Command = enum {
     set_features,
     security_recv,
     security_send,
+    // XRAM commands (bypass 0xe6 whitelist)
+    xram_probe,
+    xram_read,
+    xram_write,
+    xram_dump,
+    inject,
+    admin_cq,
+    reset,
     help,
+};
+
+const InjectCmd = enum {
+    format_nvm,
+    sanitize_block,
+    sanitize_crypto,
+    clear_wp,
 };
 
 const Args = struct {
@@ -44,6 +59,7 @@ const Args = struct {
     device_path: ?[]const u8,
     replay_file: ?[]const u8,
     dry_run: bool,
+    force: bool,
     ses: u8, // Secure Erase Setting for format
     verbose: bool,
     json_output: bool,
@@ -55,6 +71,19 @@ const Args = struct {
     // Security args
     security_protocol: u8, // Security protocol (0x00=info, 0xEF=ATA password)
     sp_specific: u16, // Protocol-specific value
+    // XRAM args
+    xram_address: u16,
+    xram_length: u16,
+    xram_value: u8,
+    xram_verify: bool,
+    // Inject args
+    inject_command: InjectCmd,
+    inject_nsid: u32,
+    inject_slot: ?u8, // Explicit SQ slot (0-7)
+    inject_tail: ?u8, // Explicit doorbell tail value
+    inject_cid: u16, // Command ID for tracking
+    // Reset args
+    reset_type: u8,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -66,15 +95,26 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .device_path = null,
         .replay_file = null,
         .dry_run = false,
+        .force = false,
         .ses = 0,
         .verbose = false,
         .json_output = false,
         .asm_only = false,
-        .feature_id = 0x84, // Default: Namespace Write Protect
+        .feature_id = 0x84,
         .feature_value = 0,
         .save_feature = false,
-        .security_protocol = 0x00, // Default: Protocol Info
+        .security_protocol = 0x00,
         .sp_specific = 0,
+        .xram_address = 0xB000,
+        .xram_length = 64,
+        .xram_value = 0,
+        .xram_verify = true,
+        .inject_command = .format_nvm,
+        .inject_nsid = 0xFFFFFFFF,
+        .inject_slot = null,
+        .inject_tail = null,
+        .inject_cid = 0x0100,
+        .reset_type = 0x01,
     };
 
     if (args.len < 2) {
@@ -129,6 +169,51 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.security_protocol = std.fmt.parseInt(u8, arg[11..], 0) catch 0;
         } else if (std.mem.startsWith(u8, arg, "--sp-specific=")) {
             result.sp_specific = std.fmt.parseInt(u16, arg[14..], 0) catch 0;
+        } else if (std.mem.eql(u8, arg, "xram-probe")) {
+            result.command = .xram_probe;
+        } else if (std.mem.eql(u8, arg, "xram-read")) {
+            result.command = .xram_read;
+        } else if (std.mem.eql(u8, arg, "xram-write")) {
+            result.command = .xram_write;
+        } else if (std.mem.eql(u8, arg, "xram-dump")) {
+            result.command = .xram_dump;
+        } else if (std.mem.eql(u8, arg, "inject")) {
+            result.command = .inject;
+        } else if (std.mem.eql(u8, arg, "admin-cq")) {
+            result.command = .admin_cq;
+        } else if (std.mem.eql(u8, arg, "reset")) {
+            result.command = .reset;
+        } else if (std.mem.startsWith(u8, arg, "--addr=")) {
+            result.xram_address = std.fmt.parseInt(u16, arg[7..], 0) catch 0xB000;
+        } else if (std.mem.startsWith(u8, arg, "--len=")) {
+            result.xram_length = std.fmt.parseInt(u16, arg[6..], 0) catch 64;
+        } else if (std.mem.startsWith(u8, arg, "--byte=")) {
+            result.xram_value = std.fmt.parseInt(u8, arg[7..], 0) catch 0;
+        } else if (std.mem.eql(u8, arg, "--no-verify")) {
+            result.xram_verify = false;
+        } else if (std.mem.eql(u8, arg, "--force")) {
+            result.force = true;
+        } else if (std.mem.startsWith(u8, arg, "--inject-cmd=")) {
+            const cmd_str = arg[13..];
+            if (std.mem.eql(u8, cmd_str, "format")) {
+                result.inject_command = .format_nvm;
+            } else if (std.mem.eql(u8, cmd_str, "sanitize-block")) {
+                result.inject_command = .sanitize_block;
+            } else if (std.mem.eql(u8, cmd_str, "sanitize-crypto")) {
+                result.inject_command = .sanitize_crypto;
+            } else if (std.mem.eql(u8, cmd_str, "clear-wp")) {
+                result.inject_command = .clear_wp;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--nsid=")) {
+            result.inject_nsid = std.fmt.parseInt(u32, arg[7..], 0) catch 0xFFFFFFFF;
+        } else if (std.mem.startsWith(u8, arg, "--slot=")) {
+            result.inject_slot = std.fmt.parseInt(u8, arg[7..], 0) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--tail=")) {
+            result.inject_tail = std.fmt.parseInt(u8, arg[7..], 0) catch null;
+        } else if (std.mem.startsWith(u8, arg, "--cid=")) {
+            result.inject_cid = std.fmt.parseInt(u16, arg[6..], 0) catch 0x0100;
+        } else if (std.mem.startsWith(u8, arg, "--reset-type=")) {
+            result.reset_type = std.fmt.parseInt(u8, arg[13..], 0) catch 0x01;
         } else if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             result.command = .help;
         } else if (arg[0] == '/') {
@@ -147,58 +232,68 @@ fn printUsage() void {
         \\USAGE:
         \\    asm2362-tool <COMMAND> [OPTIONS] <DEVICE>
         \\
-        \\COMMANDS:
+        \\DIAGNOSTIC COMMANDS:
         \\    probe         Probe device capabilities and identify bridge type
         \\    identify      Get NVMe Identify Controller/Namespace data
         \\    smart         Get NVMe SMART/Health log
-        \\    format        Format NVM (DESTRUCTIVE - erases all data)
-        \\    sanitize      Sanitize drive (DESTRUCTIVE - erases all data)
+        \\
+        \\XRAM COMMANDS (bypass 0xe6 whitelist via direct bridge XRAM access):
+        \\    xram-probe    Probe XRAM capabilities (safe, read-only)
+        \\    xram-read     Read bytes from XRAM address
+        \\    xram-write    Write a single byte to XRAM
+        \\    xram-dump     Hex dump an XRAM region
+        \\    inject        Inject NVMe command via XRAM SQ bypass (EXPERIMENTAL)
+        \\    reset         Send bridge reset (CPU or PCIe)
+        \\
+        \\LEGACY COMMANDS (blocked by 0xe6 whitelist -- use inject instead):
+        \\    format        Format NVM via 0xe6 (silently dropped by bridge)
+        \\    sanitize      Sanitize via 0xe6 (silently dropped by bridge)
+        \\    get-features  Query feature via 0xe6 (silently dropped by bridge)
+        \\    set-features  Set feature via 0xe6 (silently dropped by bridge)
+        \\    security-recv Security Receive via 0xe6 (silently dropped by bridge)
+        \\    security-send Security Send via 0xe6 (silently dropped by bridge)
+        \\
+        \\OTHER:
         \\    replay        Replay captured command sequence from JSON file
-        \\    get-features  Query NVMe feature value (e.g., write protection)
-        \\    set-features  Set NVMe feature value
-        \\    security-recv Query security protocol state
-        \\    security-send Send security protocol command
         \\    help          Show this help message
         \\
-        \\OPTIONS:
+        \\GENERAL OPTIONS:
         \\    --dry-run        Show what would be done without executing
-        \\    --ses=N          Secure Erase Setting for format (0=none, 1=user, 2=crypto)
-        \\    --asm-only       Filter to ASMedia passthrough commands only (for replay)
-        \\    --verbose        Enable verbose output
+        \\    --force          Required for destructive inject operations
+        \\    --verbose, -v    Enable verbose output
         \\    --json           Output in JSON format
-        \\    --fid=N          Feature ID for get/set-features (default: 0x84 = Write Protect)
+        \\
+        \\XRAM OPTIONS:
+        \\    --addr=0xNNNN    XRAM address (default: 0xB000 = Admin SQ)
+        \\    --len=N          Read/dump length in bytes (default: 64)
+        \\    --byte=0xNN      Value for xram-write
+        \\    --no-verify      Skip write verification readback
+        \\    --inject-cmd=CMD format | sanitize-block | sanitize-crypto | clear-wp
+        \\    --nsid=N         Namespace ID for inject (default: 0xFFFFFFFF)
+        \\    --ses=N          Secure Erase Setting (0=none, 1=user, 2=crypto)
+        \\    --reset-type=N   0=CPU reset, 1=PCIe reset (default: 1)
+        \\
+        \\LEGACY OPTIONS:
+        \\    --fid=N          Feature ID for get/set-features (default: 0x84)
         \\    --value=N        Value for set-features
-        \\    --save           Save feature persistently (for set-features)
+        \\    --save           Save feature persistently
         \\    --protocol=N     Security protocol (0x00=info, 0xEF=ATA password)
         \\    --sp-specific=N  Protocol-specific value
+        \\    --asm-only       Filter to ASMedia commands only (for replay)
         \\
         \\EXAMPLES:
-        \\    asm2362-tool probe /dev/sdb
-        \\    asm2362-tool identify /dev/sdb
-        \\    asm2362-tool smart /dev/sdb --json
-        \\    asm2362-tool format /dev/sdb --ses=1 --dry-run
-        \\    asm2362-tool get-features /dev/sdb --fid=0x84     # Query write protect
-        \\    asm2362-tool set-features /dev/sdb --fid=0x84 --value=0 --save  # Clear WP
-        \\    asm2362-tool security-recv /dev/sdb --protocol=0  # Query security info
-        \\    asm2362-tool security-recv /dev/sdb --protocol=0xef  # ATA security state
-        \\    asm2362-tool replay captured.json /dev/sdb
-        \\
-        \\FEATURE IDS (--fid):
-        \\    0x06  Volatile Write Cache
-        \\    0x84  Namespace Write Protect
-        \\
-        \\SECURITY PROTOCOLS (--protocol):
-        \\    0x00  Security Protocol Information
-        \\    0xEF  ATA Device Server Password Security
-        \\
-        \\SAFETY:
-        \\    Format and sanitize commands are DESTRUCTIVE and will erase all data.
-        \\    Always use --dry-run first to verify the operation.
+        \\    asm2362-tool probe /dev/sdb                              # Safe: detect bridge
+        \\    asm2362-tool smart /dev/sdb --json                       # Safe: read SMART
+        \\    asm2362-tool xram-probe /dev/sdb                         # Safe: probe XRAM
+        \\    asm2362-tool xram-dump --addr=0xB000 --len=512 /dev/sdb  # Dump Admin SQ
+        \\    asm2362-tool xram-dump --addr=0xB200 --len=256 /dev/sdb  # Dump MMIO regs
+        \\    asm2362-tool inject --inject-cmd=format --dry-run /dev/sdb
+        \\    asm2362-tool inject --inject-cmd=format --force /dev/sdb  # LIVE injection
+        \\    asm2362-tool reset --reset-type=1 /dev/sdb               # PCIe soft reset
         \\
         \\DEVICE:
-        \\    The SCSI device path (e.g., /dev/sdb) for the USB-attached NVMe drive.
-        \\    Do NOT use the NVMe device path (/dev/nvmeX) - this tool uses SCSI
-        \\    passthrough for USB bridges.
+        \\    SCSI device path (/dev/sdX) for USB-attached NVMe drive.
+        \\    Do NOT use NVMe paths (/dev/nvmeX) -- this tool uses SCSI passthrough.
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -244,20 +339,16 @@ pub fn main() !void {
             try commands.getSmartLog(allocator, device_path, args.json_output);
         },
         .format => {
-            if (args.dry_run) {
-                std.debug.print("DRY RUN: Would format {s} with SES={d}\n", .{ device_path, args.ses });
-                std.debug.print("WARNING: This would erase all data on the drive!\n", .{});
-            } else {
-                try format.formatNvm(allocator, device_path, args.ses);
-            }
+            std.debug.print("WARNING: The ASM2362 0xe6 whitelist blocks Format NVM (0x80).\n", .{});
+            std.debug.print("This command will be silently dropped by the bridge firmware.\n\n", .{});
+            std.debug.print("Use 'inject --inject-cmd=format' for XRAM injection bypass.\n", .{});
+            std.debug.print("Or connect directly to M.2 PCIe and use nvme-cli.\n", .{});
         },
         .sanitize => {
-            if (args.dry_run) {
-                std.debug.print("DRY RUN: Would sanitize {s}\n", .{device_path});
-                std.debug.print("WARNING: This would erase all data on the drive!\n", .{});
-            } else {
-                try sanitize.sanitize(allocator, device_path, .block_erase);
-            }
+            std.debug.print("WARNING: The ASM2362 0xe6 whitelist blocks Sanitize (0x84).\n", .{});
+            std.debug.print("This command will be silently dropped by the bridge firmware.\n\n", .{});
+            std.debug.print("Use 'inject --inject-cmd=sanitize-block' for XRAM injection bypass.\n", .{});
+            std.debug.print("Or connect directly to M.2 PCIe and use nvme-cli.\n", .{});
         },
         .replay => {
             const replay_file = args.replay_file orelse {
@@ -386,6 +477,165 @@ pub fn main() !void {
                     @tagName(result.scsi_status),
                     result.duration_ms,
                 });
+            }
+        },
+        // ── XRAM Commands ─────────────────────────────────────────
+        .xram_probe => {
+            xram.probeXram(allocator, device_path, args.verbose) catch |err| {
+                std.debug.print("XRAM probe failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        },
+        .xram_read => {
+            std.debug.print("XRAM Read: addr=0x{x:0>4}, len={d}\n", .{ args.xram_address, args.xram_length });
+            xram.dumpRegion(allocator, device_path, args.xram_address, args.xram_length) catch |err| {
+                std.debug.print("XRAM read failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        },
+        .xram_dump => {
+            xram.dumpRegion(allocator, device_path, args.xram_address, args.xram_length) catch |err| {
+                std.debug.print("XRAM dump failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+        },
+        .xram_write => {
+            std.debug.print("XRAM Write: addr=0x{x:0>4}, value=0x{x:0>2}\n", .{ args.xram_address, args.xram_value });
+            if (args.dry_run) {
+                std.debug.print("DRY RUN: Would write 0x{x:0>2} to XRAM 0x{x:0>4}\n", .{ args.xram_value, args.xram_address });
+            } else {
+                if (!xram.isWriteAddressSafe(args.xram_address)) {
+                    std.debug.print("WARNING: Address 0x{x:0>4} is outside safe write regions.\n", .{args.xram_address});
+                    if (!args.force) {
+                        std.debug.print("Use --force to override.\n", .{});
+                        std.process.exit(1);
+                    }
+                }
+                const result = xram.xdataWrite(allocator, device_path, args.xram_address, args.xram_value, args.xram_verify) catch |err| {
+                    std.debug.print("XRAM write failed: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+                std.debug.print("Result: success={}, verified={}, duration={d}ms\n", .{
+                    result.success, result.verified, result.duration_ms,
+                });
+            }
+        },
+        .admin_cq => {
+            // Admin CQ discovered at XRAM 0xBC00 (16-byte NVMe CQ entries)
+            const ADMIN_CQ_BASE: u16 = 0xBC00;
+            const CQ_ENTRY_SIZE: u16 = 16;
+            const num_entries: u16 = 8; // Read 8 entries (128 bytes)
+
+            std.debug.print("Admin Completion Queue (0x{x:0>4}, {d} entries)\n", .{ ADMIN_CQ_BASE, num_entries });
+            std.debug.print("=============================================\n\n", .{});
+
+            const cq_data = xram.readRange(allocator, device_path, ADMIN_CQ_BASE, num_entries * CQ_ENTRY_SIZE) catch |err| {
+                std.debug.print("Failed to read Admin CQ: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(cq_data);
+
+            var i: u16 = 0;
+            while (i < num_entries) : (i += 1) {
+                const off = i * CQ_ENTRY_SIZE;
+                const e = cq_data[off .. off + CQ_ENTRY_SIZE];
+                const sqhd = @as(u16, e[8]) | (@as(u16, e[9]) << 8);
+                const sqid = @as(u16, e[10]) | (@as(u16, e[11]) << 8);
+                const cid_val = @as(u16, e[12]) | (@as(u16, e[13]) << 8);
+                const status = @as(u16, e[14]) | (@as(u16, e[15]) << 8);
+                const phase = status & 1;
+                const sc = (status >> 1) & 0xFF;
+                const sct = (status >> 9) & 0x7;
+                const dnr = (status >> 14) & 1;
+
+                const is_empty = std.mem.allEqual(u8, e, 0);
+                if (is_empty) {
+                    std.debug.print("  [{d}] (empty)\n", .{i});
+                } else {
+                    std.debug.print("  [{d}] SQHD={d} SQID={d} CID=0x{x:0>4} P={d} SCT={d} SC=0x{x:0>2} DNR={d}", .{
+                        i, sqhd, sqid, cid_val, phase, sct, sc, dnr,
+                    });
+                    if (sc == 0 and sct == 0) {
+                        std.debug.print(" (Success)\n", .{});
+                    } else if (sct == 1 and sc == 0x0F) {
+                        std.debug.print(" (Feature Not Savable)\n", .{});
+                    } else if (sct == 1 and sc == 0x0D) {
+                        std.debug.print(" (Feature Not Changeable)\n", .{});
+                    } else if (sct == 0 and sc == 0x01) {
+                        std.debug.print(" (Invalid Command Opcode)\n", .{});
+                    } else if (sct == 0 and sc == 0x02) {
+                        std.debug.print(" (Invalid Field)\n", .{});
+                    } else if (sct == 0 and sc == 0x0B) {
+                        std.debug.print(" (Invalid Namespace or Format)\n", .{});
+                    } else if (sct == 0 and sc == 0x1D) {
+                        std.debug.print(" (Sanitize In Progress)\n", .{});
+                    } else {
+                        std.debug.print("\n", .{});
+                    }
+                }
+            }
+        },
+        .inject => {
+            const cid = args.inject_cid;
+            const entry = switch (args.inject_command) {
+                .format_nvm => xram.craftFormatNvmEntry(args.inject_nsid, 0, @truncate(args.ses), cid),
+                .sanitize_block => xram.craftSanitizeEntry(2, cid),
+                .sanitize_crypto => xram.craftSanitizeEntry(4, cid),
+                .clear_wp => xram.craftSetFeaturesEntry(0x84, 1, 0, true, cid),
+            };
+
+            std.debug.print("\n", .{});
+            std.debug.print("  XRAM INJECTION -- EXPERIMENTAL\n", .{});
+            std.debug.print("  Command: {s}\n", .{switch (args.inject_command) {
+                .format_nvm => "Format NVM (0x80)",
+                .sanitize_block => "Sanitize Block Erase (0x84, SANACT=2)",
+                .sanitize_crypto => "Sanitize Crypto Erase (0x84, SANACT=4)",
+                .clear_wp => "Set Features: Clear Write Protect (0x09, FID=0x84)",
+            }});
+            std.debug.print("  OPC=0x{x:0>2}, NSID=0x{x:0>8}, CDW10=0x{x:0>8}, CID=0x{x:0>4}\n", .{
+                entry.getOpcode(), entry.nsid, entry.cdw10, cid,
+            });
+            if (args.inject_slot) |s| std.debug.print("  Explicit slot: {d}\n", .{s});
+            if (args.inject_tail) |t| std.debug.print("  Explicit tail: {d}\n", .{t});
+            std.debug.print("\n", .{});
+
+            const is_dry = args.dry_run or !args.force;
+            if (is_dry and !args.dry_run) {
+                std.debug.print("Use --force to execute (doorbell will be rung).\n", .{});
+                std.debug.print("Running in dry-run mode (write + verify without doorbell).\n\n", .{});
+            }
+
+            const result = xram.injectCommand(
+                allocator,
+                device_path,
+                entry,
+                is_dry,
+                args.verbose or is_dry,
+                args.inject_slot,
+                args.inject_tail,
+            ) catch |err| {
+                std.debug.print("Injection failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            std.debug.print("\nInjection result:\n", .{});
+            std.debug.print("  Slot used: {d}\n", .{result.slot_used});
+            std.debug.print("  Bytes written: {d}\n", .{result.bytes_written});
+            std.debug.print("  Verified: {}\n", .{result.verified});
+            std.debug.print("  Doorbell rung: {}\n", .{result.doorbell_rung});
+            std.debug.print("  Duration: {d}ms\n", .{result.total_duration_ms});
+        },
+        .reset => {
+            const reset_type: xram.ResetType = @enumFromInt(args.reset_type);
+            std.debug.print("Bridge Reset: {s}\n", .{reset_type.toString()});
+            if (args.dry_run) {
+                std.debug.print("DRY RUN: Would send {s}\n", .{reset_type.toString()});
+            } else {
+                xram.resetBridge(device_path, reset_type) catch |err| {
+                    std.debug.print("Reset failed: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+                std.debug.print("Reset command sent.\n", .{});
             }
         },
         .help => {
