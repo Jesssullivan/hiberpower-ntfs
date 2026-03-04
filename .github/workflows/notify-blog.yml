@@ -1,0 +1,19 @@
+name: Notify Blog of Content Update
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/blog/**'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger blog collection
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BLOG_DISPATCH_TOKEN }}
+          repository: jesssullivan/jesssullivan.github.io
+          event-type: external-post-update
+          client-payload: '{"source_repo": "Jesssullivan/hiberpower-ntfs"}'

@@ -54,8 +54,9 @@ This directory contains research notes, analysis, and workflow documentation for
 
 | Document | Description |
 |----------|-------------|
-| [recovery-journey.mdx](blog/recovery-journey.mdx) | **The Journey** -- Narrative blog post covering the full recovery story from discovery to success |
-| [xram-injection-guide.mdx](blog/xram-injection-guide.mdx) | **Technical Deep Dive** -- Complete reference guide for ASM2362 XRAM injection technique |
+| [recovery-journey.md](blog/recovery-journey.md) | **The Journey** -- Narrative blog post covering the full recovery story from discovery to success |
+| [xram-injection-guide.md](blog/xram-injection-guide.md) | **Technical Deep Dive** -- Complete reference guide for ASM2362 XRAM injection technique |
+| [AGENTS.md](blog/AGENTS.md) | Writing style guide for AI assistants matching the author's voice |
 
 ## Archive (`archive/`)
 

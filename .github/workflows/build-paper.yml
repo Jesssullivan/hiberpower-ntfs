@@ -1,0 +1,39 @@
+name: Build LaTeX Paper
+
+on:
+  push:
+    paths:
+      - 'docs/paper/**'
+  pull_request:
+    paths:
+      - 'docs/paper/**'
+  workflow_dispatch:
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Tectonic
+        uses: wtfjoke/setup-tectonic@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build paper PDF
+        run: |
+          cd docs/paper
+          tectonic recovery-paper.tex
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-paper
+          path: docs/paper/recovery-paper.pdf
+
+      - name: Commit PDF (on push to main)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: rebuild recovery-paper.pdf"
+          file_pattern: docs/paper/recovery-paper.pdf
