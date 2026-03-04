@@ -1,10 +1,13 @@
 ---
 title: "From Bricked to Recovered: The Story of Hacking an NVMe SSD Back to Life"
 date: "2026-03-04"
-author: "J. Sullivan"
-tags: ["nvme", "ssd-recovery", "reverse-engineering", "usb-bridge", "zig"]
 description: "How I recovered a write-protected NVMe SSD by reverse engineering a USB bridge chip and injecting commands directly into its memory — no professional tools needed."
-publish_to: blog
+tags: ["nvme", "ssd-recovery", "reverse-engineering", "usb-bridge", "zig"]
+published: true
+category: "hardware"
+source_repo: "Jesssullivan/hiberpower-ntfs"
+source_path: "docs/blog/recovery-journey.md"
+publish_to: "blog"
 ---
 
 # From Bricked to Recovered: The Story of Hacking an NVMe SSD Back to Life
@@ -106,23 +109,22 @@ usb 1-2.3: reset high-speed USB device number 23 using xhci_hcd
 
 To understand what was happening -- and more importantly, why every tool lied to me about it -- you need to understand the hardware stack:
 
-```
-+---------------------------------------------+
-|  NVMe SSD: Silicon Power 256GB              |
-|  Controller: Phison PS5012-E12              |
-|  State: FTL corrupted, read-only mode       |
-+----------------------+----------------------+
-                       | M.2 PCIe
-+----------------------+----------------------+
-|  USB Bridge: ASMedia ASM2362                |
-|  VID:PID = 0x174c:0x2362                    |
-|  CPU: 8051-compatible, ~114 MHz             |
-|  XRAM: 64KB mapped memory                   |
-+----------------------+----------------------+
-                       | USB 3.1 Gen 2
-+----------------------+----------------------+
-|  Linux: UAS driver -> /dev/sdb              |
-+---------------------------------------------+
+```mermaid
+graph TB
+    subgraph host ["Linux Host"]
+        LINUX["UAS / usb-storage driver<br/>/dev/sdb"]
+    end
+    subgraph bridge ["USB Bridge: ASMedia ASM2362"]
+        BRIDGE["8051 CPU @ 114 MHz<br/>64KB XRAM<br/>VID:PID 174c:2362<br/><b>Opcode whitelist here</b>"]
+    end
+    subgraph ssd ["NVMe SSD: Silicon Power 256GB"]
+        SSD["Phison PS5012-E12 controller<br/>FTL corrupted → read-only mode<br/>SMART Critical Warning bit 3"]
+    end
+    LINUX -->|"USB 3.1 Gen 2<br/>SCSI commands"| BRIDGE
+    BRIDGE -->|"M.2 PCIe Gen3 x2<br/>NVMe commands (filtered!)"| SSD
+
+    style bridge fill:#ff6b6b22,stroke:#ff6b6b
+    style ssd fill:#ffa50022,stroke:#ffa500
 ```
 
 Three layers of hardware. Three layers of firmware. Three layers of potential misunderstanding. The NVMe SSD at the bottom speaks PCIe/NVMe. The ASMedia ASM2362 USB bridge in the middle translates between NVMe and USB/SCSI. Linux at the top talks SCSI to what it thinks is a normal USB mass storage device.
@@ -273,6 +275,21 @@ The culprit was UAS -- USB Attached SCSI protocol. The Linux kernel had loaded t
 
 The ASM2362's vendor commands use non-standard CDB sizes (6 bytes for 0xE4/0xE5, 12 bytes for 0xE8) and non-standard data transfer patterns. UAS expects standard SCSI command structures and chokes on the vendor deviations.
 
+```mermaid
+flowchart TD
+    START["Vendor SCSI command<br/>(0xE4 / 0xE5 / 0xE8)"] --> CHECK{Which USB<br/>driver?}
+    CHECK -->|"UAS<br/>(default)"| UAS["UAS driver rejects<br/>non-standard CDB"]
+    UAS --> FAIL["DID_ERROR<br/>errno -75 EOVERFLOW"]
+    CHECK -->|"usb-storage<br/>(BOT mode)"| BOT["BOT passes CDB<br/>without inspection"]
+    BOT --> OK["Command reaches<br/>ASM2362 bridge"]
+
+    SWITCH["modprobe usb-storage<br/>quirks=174c:2362:u"] -.->|"Switch driver"| BOT
+
+    style FAIL fill:#ff6b6b22,stroke:#ff6b6b
+    style OK fill:#51cf6622,stroke:#51cf66
+    style SWITCH fill:#4ecdc422,stroke:#4ecdc4
+```
+
 The fix was to force the device into BOT mode -- Bulk-Only Transport, the older, simpler USB Mass Storage protocol. BOT is dumber but more permissive. It passes CDBs through without scrutinizing their format:
 
 ```bash
@@ -389,6 +406,34 @@ On native PCIe, the doorbell is a memory-mapped I/O register at a fixed offset f
 But I was not on native PCIe. I was going through a USB bridge. The NVMe controller's MMIO registers are on the PCIe side of the bridge, not the USB side. I could not just write to BAR0 + 0x1000 from Linux.
 
 Cyrozap's reverse engineering came through once more. The ASM2362 has a PCIe TLP (Transaction Layer Packet) engine accessible through XRAM registers at 0xB200-0xB296. This engine can construct and transmit arbitrary PCIe transactions across the bridge's PCIe port. By writing the right values to the TLP header registers, data register, and control/status register, I could synthesize a PCIe memory write -- a doorbell ring -- from the USB side.
+
+```mermaid
+sequenceDiagram
+    participant Host as Linux Host
+    participant Bridge as ASM2362 Bridge<br/>(XRAM)
+    participant TLP as TLP Engine<br/>(0xB200)
+    participant NVMe as NVMe Controller
+
+    Note over Host,NVMe: XRAM Injection Sequence
+
+    Host->>Bridge: 0xE4: Read Admin SQ (0xB000)
+    Bridge-->>Host: Current queue state (4 entries)
+
+    Host->>Bridge: 0xE5: Write 64 bytes to slot 0
+    Note right of Bridge: 64 individual byte writes<br/>each verified via 0xE4
+
+    Host->>Bridge: 0xE4: Full readback verify
+    Bridge-->>Host: All 64 bytes match
+
+    Host->>TLP: Write new tail value to 0xB220
+    Host->>TLP: Write TLP header to 0xB210
+    Host->>TLP: Trigger (0x0F → 0xB254)
+    TLP->>NVMe: PCIe Memory Write TLP<br/>(BAR0 + 0x1000 = doorbell)
+    Note right of NVMe: Controller processes<br/>injected command
+
+    Host->>Bridge: 0xE4: Read Admin CQ (0xBC00)
+    Bridge-->>Host: CID=0x4242, Status=Success
+```
 
 The sequence, ported from cyrozap's Python `pcie_gen_req()` function into Zig:
 
@@ -706,6 +751,21 @@ $ readlink /sys/devices/.../1-3:1.0/driver
 - [smartmontools](https://github.com/smartmontools/smartmontools/blob/master/smartmontools/scsinvme.cpp) -- Reference `sntasmedia_device` 0xe6 implementation
 - [smx-smx/ASMTool](https://github.com/smx-smx/ASMTool) -- ASMedia firmware dumper
 - [Phison PS5012 Recovery Tools](https://www.usbdev.ru/files/phison/ps5012reinitialtool/) -- Vendor-specific recovery for Phison controllers
+
+---
+
+## Research Paper
+
+The full technical paper covers the NVMe specification details, XRAM memory layout, PCIe TLP doorbell mechanism, and complete injection workflow in IEEE conference format.
+
+<iframe
+  src="/papers/recovery-paper.pdf"
+  class="w-full rounded-lg"
+  style="height: 85vh; min-height: 600px; border: 1px solid #e5e7eb;"
+  title="XRAM Injection: Recovering Write-Protected NVMe SSDs Through USB Bridge Memory Manipulation"
+></iframe>
+
+<a href="/papers/recovery-paper.pdf" download class="inline-block mt-4 text-sm underline">Download PDF</a>
 
 ---
 

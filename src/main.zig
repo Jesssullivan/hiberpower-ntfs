@@ -29,8 +29,6 @@ const Command = enum {
     probe,
     identify,
     smart,
-    format,
-    sanitize,
     replay,
     get_features,
     set_features,
@@ -141,10 +139,6 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.command = .identify;
         } else if (std.mem.eql(u8, arg, "smart")) {
             result.command = .smart;
-        } else if (std.mem.eql(u8, arg, "format")) {
-            result.command = .format;
-        } else if (std.mem.eql(u8, arg, "sanitize")) {
-            result.command = .sanitize;
         } else if (std.mem.eql(u8, arg, "replay")) {
             result.command = .replay;
             if (i + 1 < args.len) {
@@ -245,13 +239,11 @@ fn printUsage() void {
         \\    inject        Inject NVMe command via XRAM SQ bypass (EXPERIMENTAL)
         \\    reset         Send bridge reset (CPU or PCIe)
         \\
-        \\LEGACY COMMANDS (blocked by 0xe6 whitelist -- use inject instead):
-        \\    format        Format NVM via 0xe6 (silently dropped by bridge)
-        \\    sanitize      Sanitize via 0xe6 (silently dropped by bridge)
-        \\    get-features  Query feature via 0xe6 (silently dropped by bridge)
-        \\    set-features  Set feature via 0xe6 (silently dropped by bridge)
-        \\    security-recv Security Receive via 0xe6 (silently dropped by bridge)
-        \\    security-send Security Send via 0xe6 (silently dropped by bridge)
+        \\0xE6 PASSTHROUGH COMMANDS (most blocked by bridge whitelist -- use inject instead):
+        \\    get-features  Query feature via 0xe6
+        \\    set-features  Set feature via 0xe6
+        \\    security-recv Security Receive via 0xe6
+        \\    security-send Security Send via 0xe6
         \\
         \\OTHER:
         \\    replay        Replay captured command sequence from JSON file
@@ -273,7 +265,7 @@ fn printUsage() void {
         \\    --ses=N          Secure Erase Setting (0=none, 1=user, 2=crypto)
         \\    --reset-type=N   0=CPU reset, 1=PCIe reset (default: 1)
         \\
-        \\LEGACY OPTIONS:
+        \\PASSTHROUGH OPTIONS:
         \\    --fid=N          Feature ID for get/set-features (default: 0x84)
         \\    --value=N        Value for set-features
         \\    --save           Save feature persistently
@@ -337,18 +329,6 @@ pub fn main() !void {
         },
         .smart => {
             try commands.getSmartLog(allocator, device_path, args.json_output);
-        },
-        .format => {
-            std.debug.print("WARNING: The ASM2362 0xe6 whitelist blocks Format NVM (0x80).\n", .{});
-            std.debug.print("This command will be silently dropped by the bridge firmware.\n\n", .{});
-            std.debug.print("Use 'inject --inject-cmd=format' for XRAM injection bypass.\n", .{});
-            std.debug.print("Or connect directly to M.2 PCIe and use nvme-cli.\n", .{});
-        },
-        .sanitize => {
-            std.debug.print("WARNING: The ASM2362 0xe6 whitelist blocks Sanitize (0x84).\n", .{});
-            std.debug.print("This command will be silently dropped by the bridge firmware.\n\n", .{});
-            std.debug.print("Use 'inject --inject-cmd=sanitize-block' for XRAM injection bypass.\n", .{});
-            std.debug.print("Or connect directly to M.2 PCIe and use nvme-cli.\n", .{});
         },
         .replay => {
             const replay_file = args.replay_file orelse {

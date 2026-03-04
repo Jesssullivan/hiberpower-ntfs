@@ -1,10 +1,13 @@
 ---
 title: "XRAM Injection: Bypassing USB Bridge Whitelists to Recover NVMe Drives"
 date: "2026-03-04"
-author: "J. Sullivan"
-tags: ["nvme", "asm2362", "xram", "scsi", "usb-bridge", "reverse-engineering", "zig", "low-level"]
 description: "A complete technical guide to the XRAM injection technique for sending arbitrary NVMe admin commands through the ASMedia ASM2362 USB-to-NVMe bridge, bypassing its firmware opcode whitelist."
-publish_to: blog
+tags: ["nvme", "asm2362", "xram", "scsi", "usb-bridge", "reverse-engineering", "zig", "low-level"]
+published: true
+category: "hardware"
+source_repo: "Jesssullivan/hiberpower-ntfs"
+source_path: "docs/blog/xram-injection-guide.md"
+publish_to: "blog"
 ---
 
 # XRAM Injection: Bypassing USB Bridge Whitelists to Recover NVMe Drives
@@ -53,6 +56,36 @@ The ASM2362 runs an **8051-compatible microcontroller** at approximately 114 MHz
 The 8051 has access to a 64KB external RAM (XRAM) address space, mapped from 0x0000 to 0xFFFF. This memory region contains everything the bridge needs to operate: CPU registers, firmware variables, NVMe queue structures, PCIe controller registers, and data buffers. Unlike the NVMe controller's host memory (which would be system RAM on a native PCIe connection), this XRAM is on the bridge chip itself and is directly accessible through vendor SCSI commands.
 
 Here is the XRAM memory map as determined through firmware reverse engineering (cyrozap/usb-to-pcie-re) and our own empirical probing:
+
+```mermaid
+block-beta
+    columns 1
+    block:cpu["0x0000 – 0x07FF: CPU Registers & Firmware Variables (2 KB)"]
+        columns 1
+        fw["0x07F0: Firmware Version (6 bytes)"]
+    end
+    space
+    block:usb["0x9000 – 0x9FFF: USB/SCSI Control Registers (~4 KB)"]
+    end
+    space
+    block:iosq["0xA000 – 0xAFFF: NVMe I/O Submission Queue (4 KB)"]
+    end
+    space
+    block:adminsq["0xB000 – 0xB1FF: Admin Submission Queue (512 B) — READ/WRITE ★"]
+    end
+    block:pcie["0xB200 – 0xB7FF: PCIe MMIO / TLP Engine (1.5 KB)"]
+    end
+    block:iocq["0xB800 – 0xBBFF: I/O Completion Queue (1 KB)"]
+    end
+    block:admincq["0xBC00 – 0xBFFF: Admin Completion Queue (1 KB)"]
+    end
+    space
+    block:data["0xF000 – 0xFFFF: NVMe Data Buffer (4 KB)"]
+    end
+
+    style adminsq fill:#51cf6622,stroke:#51cf66
+    style pcie fill:#4ecdc422,stroke:#4ecdc4
+```
 
 | Address Range | Size | Contents | Access |
 |---------------|------|----------|--------|
@@ -344,7 +377,32 @@ The TLP engine is controlled through four XRAM register groups:
 
 Note the endianness: TLP headers and data are stored in **big-endian** format, even though the 8051 and NVMe structures elsewhere use little-endian. Each 32-bit value written to these registers requires four separate 0xE5 commands (one byte at a time, most-significant byte first).
 
-### Step 3: The Doorbell Sequence (7 Steps)
+### Step 3: The Doorbell Sequence
+
+```mermaid
+sequenceDiagram
+    participant Host as Linux Host<br/>(0xE5 writes)
+    participant XRAM as Bridge XRAM<br/>(TLP registers)
+    participant PCIe as PCIe Bus
+    participant NVMe as NVMe Controller
+
+    Note over Host,NVMe: Doorbell Ring Sequence
+
+    Host->>XRAM: Write tail value → 0xB220<br/>(4 bytes, big-endian)
+    Host->>XRAM: Write TLP header → 0xB210<br/>(12 bytes: 0x40000001, BE mask, addr)
+    Host->>XRAM: Clear timeout → 0xB296 = 0x01
+    Host->>XRAM: Trigger → 0xB254 = 0x0F
+
+    loop Poll ready
+        Host->>XRAM: Read 0xB296
+        XRAM-->>Host: Check bit 2
+    end
+
+    Host->>XRAM: Send TLP → 0xB296 = 0x04
+    XRAM->>PCIe: Posted Memory Write TLP
+    PCIe->>NVMe: Write to BAR0 + 0x1000<br/>(Admin SQ Tail Doorbell)
+    Note right of NVMe: Controller fetches<br/>command from SQ slot
+```
 
 ```python
 # 1. Write the new tail value (big-endian u32) to the data register
@@ -485,6 +543,21 @@ pub fn craftSetFeaturesEntry(fid: u8, nsid: u32, value: u32, save: bool, command
 ## Complete Injection Workflow
 
 XRAM injection proceeds in six phases. Each phase produces observable output, making it possible to diagnose failures at every step.
+
+```mermaid
+flowchart LR
+    P1["Phase 1<br/>Read Admin SQ"] --> P2["Phase 2<br/>Select Slot"]
+    P2 --> P3["Phase 3<br/>Write 64 Bytes"]
+    P3 --> P4["Phase 4<br/>Verify Readback"]
+    P4 --> P5{"Phase 5<br/>Dry run?"}
+    P5 -->|"--dry-run"| SKIP["Skip doorbell<br/>(safe)"]
+    P5 -->|"--force"| RING["Ring TLP<br/>Doorbell"]
+    RING --> P6["Phase 6<br/>Check CQ"]
+
+    style SKIP fill:#ffa50022,stroke:#ffa500
+    style RING fill:#ff6b6b22,stroke:#ff6b6b
+    style P6 fill:#51cf6622,stroke:#51cf66
+```
 
 ### Phase 1: Read Admin SQ State
 
