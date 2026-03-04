@@ -71,10 +71,18 @@ pub fn build(b: *std.Build) void {
     });
     replay_tests.linkLibC();
 
+    const xram_tests = b.addTest(.{
+        .root_source_file = b.path("src/asm2362/xram.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    xram_tests.linkLibC();
+
     const run_sg_io_tests = b.addRunArtifact(sg_io_tests);
     const run_sense_tests = b.addRunArtifact(sense_tests);
     const run_passthrough_tests = b.addRunArtifact(passthrough_tests);
     const run_replay_tests = b.addRunArtifact(replay_tests);
+    const run_xram_tests = b.addRunArtifact(xram_tests);
 
     const test_all_step = b.step("test-all", "Run all module tests");
     test_all_step.dependOn(&run_unit_tests.step);
@@ -82,4 +90,5 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(&run_sense_tests.step);
     test_all_step.dependOn(&run_passthrough_tests.step);
     test_all_step.dependOn(&run_replay_tests.step);
+    test_all_step.dependOn(&run_xram_tests.step);
 }

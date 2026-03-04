@@ -1,6 +1,9 @@
 # This file
 .gitignore
 
+# Project config (local only)
+CLAUDE.md
+
 # Zig build artifacts
 zig-out/
 zig-cache/
@@ -63,3 +66,6 @@ docs/paper/*.pdf
 docs/paper/*.synctex.gz
 docs/paper/*.fls
 docs/paper/*.fdb_latexmk
+docs/paper/*.bbl
+docs/paper/*.blg
+docs/paper/*.toc
