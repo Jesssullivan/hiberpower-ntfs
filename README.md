@@ -2,6 +2,12 @@
 
 Experimental research into recovering NVMe SSDs exhibiting firmware-level write protection after FTL corruption. **This is a project**
 
+### BLog posts:
+
+- [xram injection technical blog post](https://transscendsurvival.org/blog/xram-injection-bypassing-usb-bridge-whitelists-to-recover-nvme-drives)
+- [overview / storytime blog post](https://transscendsurvival.org/blog/from-bricked-to-recovered-the-story-of-hacking-an-nvme-ssd-back-to-life)
+- [Full paper - *and tell your friends to also write papers for fun*](https://transscendsurvival.org/papers/recovery-paper.pdf)
+
 I used this nvme stick and the ASM2362 every day all day between 2017 and 2020 for all my laptop computing.  It happpily ran Tails, ubuntu budgie, and even windows via a little usb 3 enclosure velcroed to my laptop during this time.  I haven't thrown it away because it kept me safe under political duress, because I am stubborn, and because I think that it should continue to work forever. 
 
 
