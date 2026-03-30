@@ -5,22 +5,32 @@
 **Device**: ASM2362 (VID 0x174C, PID 0x2362) + Silicon Power SPCC M.2 PCIe SSD (Phison PS5012-E12, FW H211011a)
 **Host**: Mac Mini M2 (petting-zoo-mini), macOS 15 Sequoia
 
-## UPDATE: Root Cause Found — USB Link Speed Degradation
+## UPDATE 2: Definitive Root Cause — Enclosure Firmware Missing BOS/SuperSpeed Descriptor
 
-**The ASM2362 is negotiating USB 2.0 (480 Mbps) instead of USB 3.x (5/10 Gbps).**
+**The enclosure firmware only exposes a USB 2.1 device descriptor with NO SuperSpeed capability.**
 
 ```
-ioreg output:
-  USBSpeed = 3          ← port supports SuperSpeed
-  UsbLinkSpeed = 480000000  ← actual link: 480 Mbps = USB 2.0!
+ioreg — USB device descriptor:
+  bcdUSB = 0x0210       ← USB 2.1 (triggers BOS query per USB 3.0 spec)
+  bMaxPacketSize0 = 64  ← USB 2.0 endpoint size (SS uses 512)
   Device Speed = 2      ← High Speed = USB 2.0
+  bInterfaceProtocol = 80  ← BOT only (no UAS)
+  bNumConfigurations = 1   ← single config, no SS alternate
+
+ioreg — USB 3.x Gen2 hub port statistics:
+  kPortStatConnectCount = 0  ← SuperSpeed PHY NEVER CONNECTED
 ```
 
-At USB 2.0 speeds, the bridge's write timeout window is too tight for the NVMe SSD's write latency, causing the macOS USB mass storage driver to return EINTR on every I/O operation (reads AND writes to the raw block device).
+Per USB 3.0 spec section 9.2.6.6, `bcdUSB=0x0210` is correct for a USB 3.x device's High-Speed descriptor — the host must then query the **BOS (Binary Object Store) descriptor** to discover SuperSpeed capability. **This enclosure's firmware does not include a valid BOS descriptor with SuperSpeed Device Capability**, so the host never attempts SuperSpeed link training.
 
-**This is NOT an APFS issue** — raw `dd` to `/dev/rdisk4` also returns EINTR. It's also NOT a BOT vs UAS issue. The USB physical link is degraded, likely due to cable quality, USB port signal integrity, or ASM2362 link training firmware.
+**This is NOT a cable, port, or macOS issue.** The enclosure firmware is fundamentally misconfigured.
 
-**Fixes to try**: different USB-C cable (with proper SuperSpeed shielding), different port, or ASM2362 firmware update.
+### Fix Path
+The firmware can be reflashed via SCSI vendor command `0xE3` (Firmware Write) from Linux, where we have working SCSI access. The ASM2362 chip fully supports USB 3.1 Gen 2 — only the firmware descriptor table needs updating.
+
+## UPDATE 1: USB Link Speed Degradation (Superseded)
+
+Previous finding: device negotiating USB 2.0. This was a symptom, not the cause. The cause is the missing BOS/SuperSpeed descriptor in the enclosure firmware.
 
 ## Symptom
 
@@ -264,6 +274,56 @@ This affects a wide class of consumer USB NVMe enclosures:
 - Many enclosures ship with BOT-only firmware even though the hardware supports UAS
 - **macOS users formatting these drives as APFS may experience silent write failures**
 - The failure mode (EINTR) is subtle — most tools don't retry, and APFS metadata corruption can result
+
+## Firmware Flash Path (via Linux SCSI)
+
+The ASM2362's SPI flash is accessible via vendor SCSI commands. We have working SCSI passthrough on yoga (Linux). The firmware can be updated without Windows or MPTool.
+
+### Commands Available (from cyrozap/usb-to-pcie-re)
+
+| Opcode | Direction | Command | Purpose |
+|--------|-----------|---------|---------|
+| 0xE0 | Read | Read Config | 128 bytes bridge configuration (slots 0/1) |
+| 0xE2 | Read | Flash Read | Dump SPI flash contents (current firmware) |
+| 0xE3 | Write | Firmware Write | Flash new firmware (starting at address 0x80) |
+| 0xE8 | None | Reset | CPU or PCIe reset after flash |
+
+### Workflow
+
+1. **Dump current firmware** (safety backup):
+   ```bash
+   sudo asm2362-tool xram-dump --addr=0x0000 --len=4096 /dev/sg0  # Config region
+   # Full firmware dump via 0xE2 (needs tool extension)
+   ```
+
+2. **Download latest firmware** from [station-drivers.com](https://www.station-drivers.com/):
+   - Target: `230927_91_00_00` (family `91`, latest known)
+   - This firmware should include proper BOS descriptor with SuperSpeed capability
+
+3. **Flash firmware** via 0xE3 at address 0x80
+
+4. **Reset bridge** via 0xE8 (PCIe soft reset)
+
+5. **Verify**: Replug device, check `bcdUSB` and `UsbLinkSpeed` in ioreg
+
+### hiberpower Tool Extension Needed
+
+The asm2362-tool currently supports 0xE4/0xE5 (XRAM) and 0xE8 (reset). Adding 0xE2 (flash read) and 0xE3 (flash write) would make it a complete firmware management tool. This is tracked in the hiberpower roadmap.
+
+### Risk Assessment
+
+- **Brick risk**: Low — the ASM2362 bootloader survives failed flashes (responds to SCSI vendor commands even without valid firmware)
+- **Recovery**: UART debug at 921600 8N1 on bridge pins 62/63 if bootloader is corrupted
+- **Recommendation**: Always dump current firmware before flashing
+
+## Chassis Redesign Considerations
+
+Given the enclosure firmware is capped at USB 2.0, the current chassis is not achieving the ASM2362's potential (10 Gbps). A redesigned chassis should:
+
+1. **Ship with verified firmware** — include BOS descriptor with SuperSpeed capability
+2. **Thermal management** — ASM2362 throttles under sustained NVMe write load at full speed
+3. **Cable quality** — bundle a USB 3.2 Gen 2 certified cable
+4. **Test matrix** — verify enumeration on macOS (M1-M4), Linux, Windows at SuperSpeed
 
 ## References
 
