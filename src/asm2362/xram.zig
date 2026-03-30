@@ -20,6 +20,10 @@ const sense = @import("../scsi/sense.zig");
 
 // ── SCSI vendor opcodes ──────────────────────────────────────────────
 
+pub const CONFIG_READ_OPCODE: u8 = 0xE0;
+pub const CONFIG_WRITE_OPCODE: u8 = 0xE1;
+pub const FLASH_READ_OPCODE: u8 = 0xE2;
+pub const FIRMWARE_WRITE_OPCODE: u8 = 0xE3;
 pub const XDATA_READ_OPCODE: u8 = 0xE4;
 pub const XDATA_WRITE_OPCODE: u8 = 0xE5;
 pub const RESET_OPCODE: u8 = 0xE8;
@@ -253,6 +257,153 @@ pub fn buildResetCdb(reset_type: ResetType) [12]u8 {
     cdb[0] = RESET_OPCODE;
     cdb[1] = @intFromEnum(reset_type);
     return cdb;
+}
+
+/// Build Config Read CDB (0xE0) — 6 bytes
+///
+/// Byte layout: E0 [image_idx] [00 x4]
+/// Returns: 128 bytes of configuration data from flash image 0 or 1
+/// Source: cyrozap/usb-to-pcie-re ASM2x6x/doc/Notes.md
+pub fn buildConfigReadCdb(image_index: u8) [6]u8 {
+    return .{ CONFIG_READ_OPCODE, image_index, 0x00, 0x00, 0x00, 0x00 };
+}
+
+/// Build Flash Read CDB (0xE2) — 6 bytes
+///
+/// Byte layout: E2 [00] [length_BE32 (4 bytes)]
+/// Returns: N bytes of flash data starting from address 0
+/// Source: cyrozap/usb-to-pcie-re ASM2x6x/doc/Notes.md
+pub fn buildFlashReadCdb(length: u32) [6]u8 {
+    return .{
+        FLASH_READ_OPCODE,
+        0x00,
+        @truncate((length >> 24) & 0xFF),
+        @truncate((length >> 16) & 0xFF),
+        @truncate((length >> 8) & 0xFF),
+        @truncate(length & 0xFF),
+    };
+}
+
+/// Build Firmware Write CDB (0xE3) — 6 bytes
+///
+/// Byte layout: E3 [00] [length_BE32 (4 bytes)]
+/// Payload: N bytes of firmware data, written to flash at address 0x80
+/// Source: cyrozap/usb-to-pcie-re ASM2x6x/doc/Notes.md
+/// WARNING: This writes to SPI flash. Always dump firmware first with 0xE2.
+pub fn buildFirmwareWriteCdb(length: u32) [6]u8 {
+    return .{
+        FIRMWARE_WRITE_OPCODE,
+        0x00,
+        @truncate((length >> 24) & 0xFF),
+        @truncate((length >> 16) & 0xFF),
+        @truncate((length >> 8) & 0xFF),
+        @truncate(length & 0xFF),
+    };
+}
+
+// ── Flash Operations ────────────────────────────────────────────────
+
+/// Read bridge configuration data (128 bytes from image 0 or 1).
+/// Contains USB descriptor tables, VID/PID, and firmware settings.
+pub fn readConfig(
+    allocator: std.mem.Allocator,
+    device_path: []const u8,
+    image_index: u8,
+) XramError!XramReadResult {
+    const data_buffer = allocator.alloc(u8, 128) catch return XramError.OutOfMemory;
+    errdefer allocator.free(data_buffer);
+    @memset(data_buffer, 0);
+
+    const cdb = buildConfigReadCdb(image_index);
+    const result = sg_io.execute(
+        device_path,
+        &cdb,
+        data_buffer,
+        .from_dev,
+        10000,
+    ) catch |err| {
+        return switch (err) {
+            sg_io.SgError.PermissionDenied => XramError.PermissionDenied,
+            sg_io.SgError.InvalidDevice => XramError.DeviceNotFound,
+            sg_io.SgError.Timeout => XramError.Timeout,
+            else => XramError.ReadFailed,
+        };
+    };
+
+    return XramReadResult{
+        .data = data_buffer,
+        .bytes_read = result.bytes_transferred,
+        .scsi_status = result.status,
+        .duration_ms = result.duration_ms,
+        .success = result.success,
+    };
+}
+
+/// Read firmware from SPI flash. Returns raw firmware binary.
+/// Use this to create a backup BEFORE writing new firmware.
+pub fn flashRead(
+    allocator: std.mem.Allocator,
+    device_path: []const u8,
+    length: u32,
+) XramError!XramReadResult {
+    const data_buffer = allocator.alloc(u8, length) catch return XramError.OutOfMemory;
+    errdefer allocator.free(data_buffer);
+    @memset(data_buffer, 0);
+
+    const cdb = buildFlashReadCdb(length);
+    const result = sg_io.execute(
+        device_path,
+        &cdb,
+        data_buffer,
+        .from_dev,
+        30000, // firmware reads can be slow
+    ) catch |err| {
+        return switch (err) {
+            sg_io.SgError.PermissionDenied => XramError.PermissionDenied,
+            sg_io.SgError.InvalidDevice => XramError.DeviceNotFound,
+            sg_io.SgError.Timeout => XramError.Timeout,
+            else => XramError.ReadFailed,
+        };
+    };
+
+    return XramReadResult{
+        .data = data_buffer,
+        .bytes_read = result.bytes_transferred,
+        .scsi_status = result.status,
+        .duration_ms = result.duration_ms,
+        .success = result.success,
+    };
+}
+
+/// Write firmware to SPI flash at address 0x80.
+/// WARNING: This modifies the bridge firmware. Always backup first with flashRead().
+/// After writing, reset the bridge with resetBridge(.cpu) to activate new firmware.
+pub fn firmwareWrite(
+    device_path: []const u8,
+    firmware_data: []u8,
+) XramError!XramWriteResult {
+    const cdb = buildFirmwareWriteCdb(@intCast(firmware_data.len));
+    const result = sg_io.execute(
+        device_path,
+        &cdb,
+        firmware_data,
+        .to_dev,
+        60000, // firmware writes can be very slow
+    ) catch |err| {
+        return switch (err) {
+            sg_io.SgError.PermissionDenied => XramError.PermissionDenied,
+            sg_io.SgError.InvalidDevice => XramError.DeviceNotFound,
+            sg_io.SgError.Timeout => XramError.Timeout,
+            else => XramError.WriteFailed,
+        };
+    };
+
+    return XramWriteResult{
+        .verified = result.success,
+        .success = result.success,
+        .scsi_status = result.status,
+        .duration_ms = result.duration_ms,
+    };
 }
 
 // ── Address Safety ───────────────────────────────────────────────────
