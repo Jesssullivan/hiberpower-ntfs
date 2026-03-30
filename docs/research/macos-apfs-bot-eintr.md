@@ -1,13 +1,30 @@
-# macOS APFS + BOT Mode Write Failure: EINTR Root Cause Analysis
+# macOS USB NVMe Write Failure: EINTR Root Cause Analysis
 
-**Date**: 2026-03-29
+**Date**: 2026-03-29 (updated 2026-03-30)
 **Author**: Jess Sullivan
 **Device**: ASM2362 (VID 0x174C, PID 0x2362) + Silicon Power SPCC M.2 PCIe SSD (Phison PS5012-E12, FW H211011a)
 **Host**: Mac Mini M2 (petting-zoo-mini), macOS 15 Sequoia
 
+## UPDATE: Root Cause Found — USB Link Speed Degradation
+
+**The ASM2362 is negotiating USB 2.0 (480 Mbps) instead of USB 3.x (5/10 Gbps).**
+
+```
+ioreg output:
+  USBSpeed = 3          ← port supports SuperSpeed
+  UsbLinkSpeed = 480000000  ← actual link: 480 Mbps = USB 2.0!
+  Device Speed = 2      ← High Speed = USB 2.0
+```
+
+At USB 2.0 speeds, the bridge's write timeout window is too tight for the NVMe SSD's write latency, causing the macOS USB mass storage driver to return EINTR on every I/O operation (reads AND writes to the raw block device).
+
+**This is NOT an APFS issue** — raw `dd` to `/dev/rdisk4` also returns EINTR. It's also NOT a BOT vs UAS issue. The USB physical link is degraded, likely due to cable quality, USB port signal integrity, or ASM2362 link training firmware.
+
+**Fixes to try**: different USB-C cable (with proper SuperSpeed shielding), different port, or ASM2362 firmware update.
+
 ## Symptom
 
-All filesystem writes to APFS-formatted volumes on a USB NVMe SSD return `EINTR` (Interrupted system call). Reads succeed. The drive reports `SMART Status: Verified` and `Media Read-Only: No`. The identical drive works perfectly on Linux (Rocky Linux, tested with SG_IO, XRAM access, NVMe Identify — all successful).
+All I/O operations (reads AND writes) to a USB NVMe SSD return `EINTR` (Interrupted system call) — both at the filesystem level and the raw block device. The drive reports `SMART Status: Verified` and `Media Read-Only: No`. The identical drive works perfectly on Linux (Rocky Linux, tested with SG_IO, XRAM access, NVMe Identify — all successful).
 
 ```
 touch /Volumes/TinylandSSD/test: Interrupted system call
@@ -152,6 +169,70 @@ Known ASM2362 firmware versions from [station-drivers.com](https://www.station-d
 - 230927_91_00_00 (latest known)
 
 The `81` byte in position 3 appears to be a firmware family identifier. Our firmware's `81` matches the older firmware line. Updating to `230927_91_00_00` (family `91`) may enable UAS mode.
+
+## Diagnostic Test Results (2026-03-30)
+
+### Test 1: exFAT Write (Bypass APFS) — FAILED
+```
+$ touch /Volumes/TinylandSSD/test-write
+touch: /Volumes/TinylandSSD/test-write: Interrupted system call
+```
+Drive was reformatted as exFAT on Linux. EINTR persists. **APFS is not the cause.**
+
+### Test 2: Raw Block Device Write — FAILED
+```
+$ sudo dd if=/dev/zero of=/dev/rdisk4 bs=1m count=1
+dd: /dev/rdisk4: Interrupted system call
+```
+Bypasses filesystem entirely. EINTR at the block device level. **Filesystem is not the cause.**
+
+### Test 2b: Raw Block Device READ — FAILED
+```
+$ sudo dd if=/dev/rdisk4 of=/dev/null bs=1m count=1
+dd: /dev/rdisk4: Interrupted system call
+```
+Even reads fail. **The issue is at the USB transport level, not filesystem or write-specific.**
+
+### Test 3: Baseline (non-USB device) — PASSED
+```
+$ sudo dd if=/dev/zero of=/dev/null bs=1m count=1
+1+0 records in / 1+0 records out (5637 MB/s)
+```
+Confirms the system is healthy. Only this USB device is affected.
+
+### IOKit Statistics (Contradictory)
+```
+"Errors (Write)" = 0
+"Errors (Read)" = 0
+"Operations (Write)" = 1161
+"Bytes (Write)" = 6038528
+```
+The IOKit driver reports **zero errors** and has successfully written 6MB across 1161 operations. Some I/O IS getting through at the driver level — the EINTR is generated above the IOKit layer, likely by the BSD disk I/O subsystem timing out waiting for the slow USB 2.0 transport.
+
+### USB Link Speed Discovery
+```
+USBSpeed = 3           ← port capability: SuperSpeed (USB 3.0)
+UsbLinkSpeed = 480000000  ← negotiated: 480 Mbps (USB 2.0!)
+Device Speed = 2       ← High Speed = USB 2.0
+```
+The ASM2362 is running at USB 2.0 speed on a USB 3.0 port. This explains everything — NVMe write latency through a USB 2.0 bottleneck exceeds the macOS I/O timeout, generating EINTR.
+
+## Revised Root Cause: USB Link Speed Degradation
+
+The original hypothesis (APFS + BOT concurrency) was **wrong**. The actual issue:
+
+1. **USB link negotiation fails** — ASM2362 falls back from USB 3.x to USB 2.0
+2. **NVMe writes through USB 2.0** are extremely slow (theoretical max 60 MB/s, real ~30 MB/s)
+3. **macOS BSD layer times out** waiting for write completion at USB 2.0 speed
+4. **EINTR is returned** to the calling process
+5. **Linux works** because its USB stack has different timeout behavior and the ASM2362 may negotiate USB 3.0 successfully on Linux (different USB host controller driver)
+
+### Why Link Negotiation Fails
+Possible causes:
+- **Cable quality**: USB-C cables without proper SuperSpeed shielding fall back to USB 2.0
+- **Port signal integrity**: Some USB-C ports on Mac Mini M2 have marginal signal quality
+- **ASM2362 firmware**: Older firmware has known link training issues
+- **Enclosure design**: Poor PCB routing in cheap enclosures degrades USB 3.x signals
 
 ## Diagnostic Test Plan
 
