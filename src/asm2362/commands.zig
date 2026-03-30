@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const passthrough = @import("passthrough.zig");
-const sg_io = @import("../scsi/sg_io.zig");
+const sg_io = @import("../platform/scsi.zig");
 
 /// NVMe SMART/Health Log structure (512 bytes)
 pub const SmartLog = extern struct {

@@ -6,7 +6,7 @@
 //! - NVMe capabilities exposed through the bridge
 
 const std = @import("std");
-const sg_io = @import("../scsi/sg_io.zig");
+const sg_io = @import("../platform/scsi.zig");
 const sense = @import("../scsi/sense.zig");
 const passthrough = @import("../asm2362/passthrough.zig");
 

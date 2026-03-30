@@ -4,7 +4,7 @@
 //! Used to reproduce SP Toolbox command sequences on Linux via asm2362-tool.
 
 const std = @import("std");
-const sg_io = @import("../scsi/sg_io.zig");
+const sg_io = @import("../platform/scsi.zig");
 const sense = @import("../scsi/sense.zig");
 
 /// A captured command from Frida JSON export
