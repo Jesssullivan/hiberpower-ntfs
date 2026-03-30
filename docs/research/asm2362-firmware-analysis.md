@@ -116,27 +116,69 @@ XRAM 0080: 30 00 30 00 30 00 30 00 30 00 30 00 30 00 30 00
 
 The USB descriptors at 0x37C3 and 0x38DB (SPI flash offsets) are NOT loaded into XRAM — the 8051 reads them directly from SPI flash via the flash controller.
 
-## Root Cause Analysis
+## Root Cause Analysis (Updated 2026-03-30)
 
-The BOS descriptor **exists in the firmware** but is not being served to the host. The most likely cause:
+The BOS descriptor **exists in the firmware** but is not being served to the host.
 
-1. **Config byte 0x7A = 0xF3 (11110011)** — bit 2 is the only cleared bit in the low nibble
-   - If bit 2 controls "enable BOS descriptor response", it's disabled
-   - Setting 0xF3 → 0xF7 would enable it
+### Kaitai Struct Config Byte Decode (from cyrozap/usb-to-pcie-re asm236x_fw.ksy)
 
-2. **Config byte 0x7C = 0x02** — could control the USB version advertisement
-   - 0x02 → USB 2.x mode
-   - 0x03 → USB 3.x mode would enable SuperSpeed link training
+**Byte 0x7A = 0xF3 is NOT a simple feature flag** — it contains four 2-bit fields:
 
-3. **The config area is writable** via XRAM write (0xE5) followed by a flash save or via direct firmware write (0xE3)
+| Bits | Field | Value in 0xF3 (11110011) |
+|------|-------|--------------------------|
+| 7:4 | `idle_timer` | `1111` (max idle timeout) |
+| 3:2 | `lp_if_idle` | `00` ← low-power idle interface **DISABLED** |
+| 1:0 | `lp_if_u3` | `11` |
 
-## Next Steps
+**Byte 0x7D = 0xFF is the real problem** — ALL feature disable bits are set:
 
-1. **Cross-reference with known good firmware** — download 230927_91_00_00 from station-drivers.com, compare config bytes
-2. **Test config byte change** — write 0x7A from 0xF3 → 0xF7 (set bit 2), reset bridge, check if BOS is served
-3. **Alternatively** — change 0x7C from 0x02 → 0x03, reset, check if USB 3.0 negotiation occurs
+| Bit | Flag | Value (0xFF = all set) |
+|-----|------|----------------------|
+| 0 | `disable_slow_enumeration` | **DISABLED** |
+| 1 | `disable_2tb` | **DISABLED** |
+| 2 | `disable_low_power_mode` | **DISABLED** |
+| 3 | `disable_u1u2` | **DISABLED** ← U1/U2 required for SS link training |
+| 4 | `disable_wtg` | **DISABLED** |
+| 5 | `disable_two_leds` | **DISABLED** |
+| 6 | `disable_eup` | **DISABLED** |
+| 7 | `disable_usb_removable` | **DISABLED** |
 
-**Risk**: Modifying config bytes could brick the enclosure. We have a full firmware backup. Recovery via UART (921600 8N1) is possible if the bootloader survives.
+**`disable_u1u2 = 1` (bit 3) disables USB 3.0 U1/U2 power states**, which some hosts require for SuperSpeed link training. This is the most likely cause.
+
+**Byte 0x7E = 0x5A is a magic validation constant** (must remain 0x5A).
+
+**Byte 0x7F = checksum** — 8-bit sum of bytes 0x04 through 0x7E. Must be recalculated after any config change.
+
+### Revised Fix Strategy
+
+The primary suspect is now **byte 0x7D**, not 0x7A or 0x7C. The fix should:
+1. Clear bit 3 of 0x7D: `0xFF → 0xF7` (enable U1/U2)
+2. Optionally clear bit 2: `0xF7 → 0xF3` (enable low-power mode)
+3. Recalculate checksum at byte 0x7F
+4. Flash the patched config area
+
+### Cross-reference with known-good firmware
+
+Download `230927_91_00_00` from station-drivers.com and compare ALL config bytes 0x70-0x7F. The reference firmware should have 0x7D ≠ 0xFF (not all features disabled).
+
+### Firmware sources
+
+| Version | Source | Notes |
+|---------|--------|-------|
+| 230927_91_00_00 | station-drivers.com | Latest known, family `91` |
+| 220906_81_0F_84 | station-drivers.com | Older, family `81` |
+| Various | winraid.level1techs.com | Community dumps |
+| Various | usbdev.ru | Russian mirror |
+
+### Implementation notes
+
+- Config changes require checksum recalculation (0x7F = 8-bit sum of 0x04-0x7E)
+- Magic byte 0x7E must remain 0x5A
+- Flash via 0xE3 at address 0x80 (config area is at 0x0000-0x007F, written as part of full image)
+- Alternative: 0xE1 (Write Config) may write config area directly (needs testing)
+- Full 128KB backup exists at yoga:/tmp/asm2362_firmware_backup.bin
+
+**Risk**: Low — we have a full backup. Worst case: re-flash original firmware. UART recovery available at 921600 8N1 if bootloader is corrupted.
 
 ## References
 
