@@ -47,15 +47,27 @@ var g_plugin: ?*anyopaque = null;
 var g_device: ?*anyopaque = null;
 var g_service: c.io_service_t = 0;
 var g_exclusive: bool = false;
+var g_open_path: [128]u8 = undefined;
+var g_open_path_len: usize = 0;
+var g_ref_count: u32 = 0;
 
 // Helper: call a COM vtable method on a typed interface pointer
 /// Open a device by BSD name (e.g., "/dev/disk4" or "disk4") via IOKit
+/// Reuses existing handle if same device is requested (refcounted).
 pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
     // Strip /dev/ prefix if present
     const bsd_name = if (std.mem.startsWith(u8, device_path, "/dev/"))
         device_path[5..]
     else
         device_path;
+
+    // Reuse existing handle if same device
+    if (g_device != null and g_open_path_len > 0) {
+        if (std.mem.eql(u8, g_open_path[0..g_open_path_len], bsd_name)) {
+            g_ref_count += 1;
+            return 42;
+        }
+    }
 
     // Convert to null-terminated C string
     var name_buf: [128]u8 = undefined;
@@ -137,13 +149,22 @@ pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
     g_device = device_raw;
     g_service = scsi_service;
     g_exclusive = true;
+    @memcpy(g_open_path[0..bsd_name.len], bsd_name);
+    g_open_path_len = bsd_name.len;
+    g_ref_count = 1;
 
     return 42; // sentinel fd
 }
 
-/// Close IOKit handle
+/// Close IOKit handle (refcounted — only releases on last close)
 pub fn closeDevice(fd: std.posix.fd_t) void {
     _ = fd;
+    if (g_ref_count > 1) {
+        g_ref_count -= 1;
+        return;
+    }
+    g_ref_count = 0;
+    g_open_path_len = 0;
     if (g_device) |dev| {
         const device: *?*c.SCSITaskDeviceInterface = @ptrCast(@alignCast(&g_device));
         if (g_exclusive) {
@@ -175,9 +196,15 @@ pub fn executeOnFd(
     const dev = g_device orelse return scsi.SgError.DeviceOpenFailed;
     const device: *?*c.SCSITaskDeviceInterface = @ptrCast(@alignCast(&g_device));
 
+    std.debug.print("[iokit] executeOnFd: cdb[0]=0x{x:0>2} len={} dir={} buf={}\n", .{
+        cdb[0], cdb.len, @intFromEnum(direction), if (data_buffer) |b| b.len else 0,
+    });
+
     // Create SCSITask
-    const task_raw = device.*.?.*.CreateSCSITask.?(dev) orelse
+    const task_raw = device.*.?.*.CreateSCSITask.?(dev) orelse {
+        std.debug.print("[iokit] CreateSCSITask returned null\n", .{});
         return scsi.SgError.IoctlFailed;
+    };
 
     var task_ptr = task_raw;
     const task: *?*c.SCSITaskInterface = @ptrCast(@alignCast(&task_ptr));
@@ -193,7 +220,10 @@ pub fn executeOnFd(
         &cdb_buf,
         cdb_len,
     );
-    if (kr != c.kIOReturnSuccess) return scsi.SgError.IoctlFailed;
+    if (kr != c.kIOReturnSuccess) {
+        std.debug.print("IOKit SetCommandDescriptorBlock failed: 0x{x:0>8}\n", .{@as(u32, @bitCast(kr))});
+        return scsi.SgError.IoctlFailed;
+    }
 
     // Set scatter-gather
     if (data_buffer) |buf| {
@@ -233,6 +263,9 @@ pub fn executeOnFd(
     );
 
     if (kr != c.kIOReturnSuccess) {
+        std.debug.print("IOKit ExecuteTaskSync failed: 0x{x:0>8} (task_status={}, cdb[0]=0x{x:0>2})\n", .{
+            @as(u32, @bitCast(kr)), task_status, cdb[0],
+        });
         return switch (kr) {
             c.kIOReturnTimeout => scsi.SgError.Timeout,
             c.kIOReturnNotPermitted => scsi.SgError.PermissionDenied,
@@ -240,6 +273,8 @@ pub fn executeOnFd(
             else => scsi.SgError.IoctlFailed,
         };
     }
+
+    std.debug.print("[iokit] ExecuteTaskSync OK: task_status={} transferred={}\n", .{ task_status, transferred });
 
     // Map status
     const status: scsi.ScsiStatus = switch (task_status) {
