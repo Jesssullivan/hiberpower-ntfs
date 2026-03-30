@@ -42,6 +42,10 @@ const Command = enum {
     inject,
     admin_cq,
     reset,
+    // Flash/firmware commands
+    config_dump,
+    flash_dump,
+    flash_write,
     help,
 };
 
@@ -82,6 +86,9 @@ const Args = struct {
     inject_cid: u16, // Command ID for tracking
     // Reset args
     reset_type: u8,
+    // Flash/firmware args
+    firmware_path: ?[]const u8,
+    flash_size: u32, // bytes to read from flash (default 256KB)
 };
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
@@ -113,6 +120,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .inject_tail = null,
         .inject_cid = 0x0100,
         .reset_type = 0x01,
+        .firmware_path = null,
+        .flash_size = 256 * 1024, // 256KB default
     };
 
     if (args.len < 2) {
@@ -177,6 +186,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.command = .admin_cq;
         } else if (std.mem.eql(u8, arg, "reset")) {
             result.command = .reset;
+        } else if (std.mem.eql(u8, arg, "config-dump")) {
+            result.command = .config_dump;
+        } else if (std.mem.eql(u8, arg, "flash-dump")) {
+            result.command = .flash_dump;
+        } else if (std.mem.eql(u8, arg, "flash-write")) {
+            result.command = .flash_write;
         } else if (std.mem.startsWith(u8, arg, "--addr=")) {
             result.xram_address = std.fmt.parseInt(u16, arg[7..], 0) catch 0xB000;
         } else if (std.mem.startsWith(u8, arg, "--len=")) {
@@ -208,6 +223,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.inject_cid = std.fmt.parseInt(u16, arg[6..], 0) catch 0x0100;
         } else if (std.mem.startsWith(u8, arg, "--reset-type=")) {
             result.reset_type = std.fmt.parseInt(u8, arg[13..], 0) catch 0x01;
+        } else if (std.mem.startsWith(u8, arg, "--firmware=")) {
+            result.firmware_path = try allocator.dupe(u8, arg[11..]);
+        } else if (std.mem.startsWith(u8, arg, "--flash-size=")) {
+            result.flash_size = std.fmt.parseInt(u32, arg[13..], 0) catch 256 * 1024;
         } else if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             result.command = .help;
         } else if (arg[0] == '/') {
@@ -616,6 +635,119 @@ pub fn main() !void {
                     std.process.exit(1);
                 };
                 std.debug.print("Reset command sent.\n", .{});
+            }
+        },
+        .config_dump => {
+            std.debug.print("Reading bridge configuration (image 0)...\n\n", .{});
+            const result0 = xram.readConfig(allocator, device_path, 0) catch |err| {
+                std.debug.print("Config read failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(result0.data);
+
+            std.debug.print("Configuration Image 0 ({d} bytes):\n", .{result0.bytes_read});
+            var offset: usize = 0;
+            while (offset < result0.bytes_read) : (offset += 16) {
+                const end = @min(offset + 16, result0.bytes_read);
+                std.debug.print("  {x:0>4}: ", .{offset});
+                for (result0.data[offset..end]) |byte| {
+                    std.debug.print("{x:0>2} ", .{byte});
+                }
+                std.debug.print("\n", .{});
+            }
+        },
+        .flash_dump => {
+            const size = args.flash_size;
+            std.debug.print("Reading {d} bytes from SPI flash...\n", .{size});
+
+            const result = xram.flashRead(allocator, device_path, size) catch |err| {
+                std.debug.print("Flash read failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            defer allocator.free(result.data);
+
+            if (args.firmware_path) |path| {
+                // Write to file
+                const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+                    std.debug.print("Failed to create output file '{s}': {s}\n", .{ path, @errorName(err) });
+                    std.process.exit(1);
+                };
+                defer file.close();
+                file.writeAll(result.data[0..result.bytes_read]) catch |err| {
+                    std.debug.print("Failed to write firmware: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+                std.debug.print("Firmware dumped to '{s}' ({d} bytes)\n", .{ path, result.bytes_read });
+            } else {
+                // Hex dump to stdout
+                std.debug.print("Flash dump ({d} bytes, use --firmware=<path> to save to file):\n", .{result.bytes_read});
+                var offset: usize = 0;
+                const limit = @min(result.bytes_read, 256); // Only show first 256 bytes in terminal
+                while (offset < limit) : (offset += 16) {
+                    const end = @min(offset + 16, limit);
+                    std.debug.print("  {x:0>6}: ", .{offset});
+                    for (result.data[offset..end]) |byte| {
+                        std.debug.print("{x:0>2} ", .{byte});
+                    }
+                    std.debug.print("\n", .{});
+                }
+                if (result.bytes_read > 256) {
+                    std.debug.print("  ... ({d} more bytes, use --firmware=<path> to save all)\n", .{result.bytes_read - 256});
+                }
+            }
+        },
+        .flash_write => {
+            const fw_path = args.firmware_path orelse {
+                std.debug.print("Error: --firmware=<path> is required for flash-write\n", .{});
+                std.process.exit(1);
+            };
+
+            if (!args.force) {
+                std.debug.print("ERROR: flash-write requires --force flag.\n", .{});
+                std.debug.print("This will OVERWRITE the bridge firmware in SPI flash.\n", .{});
+                std.debug.print("Always dump current firmware first with: flash-dump --firmware=backup.bin\n", .{});
+                std.process.exit(1);
+            }
+
+            // Read firmware file
+            const file = std.fs.cwd().openFile(fw_path, .{}) catch |err| {
+                std.debug.print("Failed to open firmware file '{s}': {s}\n", .{ fw_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            defer file.close();
+
+            const stat = file.stat() catch |err| {
+                std.debug.print("Failed to stat firmware file: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            const fw_data = allocator.alloc(u8, stat.size) catch {
+                std.debug.print("Out of memory reading firmware\n", .{});
+                std.process.exit(1);
+            };
+            defer allocator.free(fw_data);
+
+            const bytes_read = file.readAll(fw_data) catch |err| {
+                std.debug.print("Failed to read firmware file: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            std.debug.print("Firmware file: {s} ({d} bytes)\n", .{ fw_path, bytes_read });
+            std.debug.print("Writing to SPI flash at address 0x80...\n", .{});
+
+            const result = xram.firmwareWrite(device_path, fw_data[0..bytes_read]) catch |err| {
+                std.debug.print("Firmware write FAILED: {s}\n", .{@errorName(err)});
+                std.debug.print("WARNING: Flash may be in inconsistent state. Do NOT power cycle.\n", .{});
+                std.debug.print("Try again or use UART recovery.\n", .{});
+                std.process.exit(1);
+            };
+
+            if (result.verified) {
+                std.debug.print("Firmware write complete ({d}ms). Reset bridge to activate.\n", .{result.duration_ms});
+                std.debug.print("Run: asm2362-tool reset --reset-type=0 {s}\n", .{device_path});
+            } else {
+                std.debug.print("Firmware write completed but SCSI status was not GOOD.\n", .{});
+                std.debug.print("Verify with flash-dump before resetting.\n", .{});
             }
         },
         .help => {
