@@ -53,8 +53,12 @@ var g_ref_count: u32 = 0;
 
 // Helper: call a COM vtable method on a typed interface pointer
 /// Open a device by BSD name (e.g., "/dev/disk4" or "disk4") via IOKit
-/// Reuses existing handle if same device is requested (refcounted).
+/// Reuses existing handle if same device is requested.
 pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
+    std.debug.print("[iokit] openDevice: path=\"{s}\" g_device={}\n", .{
+        device_path, g_device != null,
+    });
+
     // Strip /dev/ prefix if present
     const bsd_name = if (std.mem.startsWith(u8, device_path, "/dev/"))
         device_path[5..]
@@ -100,10 +104,12 @@ pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
     }
 
     if (scsi_service == 0) {
+        std.debug.print("[iokit] Failed to find IOSCSIPeripheralDeviceType00 in parent chain\n", .{});
         if (current != service) _ = c.IOObjectRelease(current);
         _ = c.IOObjectRelease(service);
         return scsi.SgError.InvalidDevice;
     }
+    std.debug.print("[iokit] Found SCSI service: {}\n", .{scsi_service});
 
     // Create CFPlugin
     var plugin: ?*?*c.IOCFPlugInInterface = null;
@@ -116,9 +122,11 @@ pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
         &score,
     );
     if (kr != c.kIOReturnSuccess or plugin == null) {
+        std.debug.print("[iokit] IOCreatePlugInInterfaceForService failed: 0x{x:0>8}\n", .{@as(u32, @bitCast(kr))});
         _ = c.IOObjectRelease(scsi_service);
         return scsi.SgError.DeviceOpenFailed;
     }
+    std.debug.print("[iokit] Plugin created OK\n", .{});
 
     // QueryInterface → SCSITaskDeviceInterface
     var device_raw: ?*anyopaque = null;
@@ -156,15 +164,21 @@ pub fn openDevice(device_path: []const u8) scsi.SgError!std.posix.fd_t {
     return 42; // sentinel fd
 }
 
-/// Close IOKit handle (refcounted — only releases on last close)
+/// Close IOKit handle — on macOS, keep the handle alive until process exit.
+/// macOS reclaims exclusive device access immediately on release, making
+/// subsequent openDevice() calls fail. Since the CLI tool operates on a
+/// single device per invocation, we hold the handle for the process lifetime.
 pub fn closeDevice(fd: std.posix.fd_t) void {
     _ = fd;
-    if (g_ref_count > 1) {
-        g_ref_count -= 1;
-        return;
-    }
-    g_ref_count = 0;
+    // Intentionally keep handle open — macOS reclaims exclusive access
+    // immediately on release, preventing re-acquisition.
+    // The handle is cleaned up on process exit by the OS.
+}
+
+/// Force-release IOKit handle (called only at process exit if needed)
+pub fn forceCloseDevice() void {
     g_open_path_len = 0;
+    g_ref_count = 0;
     if (g_device) |dev| {
         const device: *?*c.SCSITaskDeviceInterface = @ptrCast(@alignCast(&g_device));
         if (g_exclusive) {
