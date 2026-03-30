@@ -15,7 +15,7 @@
 //!   0xF000-0xFFFF  NVMe generic data buffer
 
 const std = @import("std");
-const sg_io = @import("../scsi/sg_io.zig");
+const sg_io = @import("../platform/scsi.zig");
 const sense = @import("../scsi/sense.zig");
 
 // ── SCSI vendor opcodes ──────────────────────────────────────────────

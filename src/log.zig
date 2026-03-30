@@ -3,7 +3,7 @@
 //! Log all commands sent to the device for analysis and replay.
 
 const std = @import("std");
-const sg_io = @import("scsi/sg_io.zig");
+const sg_io = @import("platform/scsi.zig");
 const sense = @import("scsi/sense.zig");
 
 /// A single command log entry

@@ -12,7 +12,7 @@
 //!   asm2362-tool replay <file> /dev/sdX    - Replay captured commands
 
 const std = @import("std");
-const sg_io = @import("scsi/sg_io.zig");
+const sg_io = @import("platform/scsi.zig");
 const sense = @import("scsi/sense.zig");
 const passthrough = @import("asm2362/passthrough.zig");
 const commands = @import("asm2362/commands.zig");
@@ -21,7 +21,7 @@ const identify = @import("nvme/identify.zig");
 const probe = @import("analysis/probe.zig");
 const replay = @import("frida/replay.zig");
 
-pub const std_options = .{
+pub const std_options: std.Options = .{
     .log_level = .info,
 };
 

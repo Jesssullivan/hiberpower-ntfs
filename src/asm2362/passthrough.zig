@@ -18,7 +18,7 @@
 //! Bytes 12-15: CDW12 (big-endian)
 
 const std = @import("std");
-const sg_io = @import("../scsi/sg_io.zig");
+const sg_io = @import("../platform/scsi.zig");
 const sense = @import("../scsi/sense.zig");
 
 /// ASMedia passthrough opcode

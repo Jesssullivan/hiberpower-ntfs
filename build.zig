@@ -12,11 +12,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Link libc for ioctl syscalls
+    // Link libc for syscalls
     exe.linkLibC();
 
-    // Add C include paths for kernel headers
-    exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    // Platform-specific build configuration
+    const target_os = target.result.os.tag;
+    if (target_os == .linux) {
+        exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    } else if (target_os == .macos) {
+        exe.linkFramework("IOKit");
+        exe.linkFramework("CoreFoundation");
+    }
 
     b.installArtifact(exe);
 
@@ -42,7 +48,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // Module tests for individual components
+    // Platform abstraction tests
+    const platform_tests = b.addTest(.{
+        .root_source_file = b.path("src/platform/scsi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    platform_tests.linkLibC();
+
+    // Legacy sg_io tests (Linux-specific, kept for backwards compatibility)
     const sg_io_tests = b.addTest(.{
         .root_source_file = b.path("src/scsi/sg_io.zig"),
         .target = target,
@@ -78,6 +92,7 @@ pub fn build(b: *std.Build) void {
     });
     xram_tests.linkLibC();
 
+    const run_platform_tests = b.addRunArtifact(platform_tests);
     const run_sg_io_tests = b.addRunArtifact(sg_io_tests);
     const run_sense_tests = b.addRunArtifact(sense_tests);
     const run_passthrough_tests = b.addRunArtifact(passthrough_tests);
@@ -86,6 +101,7 @@ pub fn build(b: *std.Build) void {
 
     const test_all_step = b.step("test-all", "Run all module tests");
     test_all_step.dependOn(&run_unit_tests.step);
+    test_all_step.dependOn(&run_platform_tests.step);
     test_all_step.dependOn(&run_sg_io_tests.step);
     test_all_step.dependOn(&run_sense_tests.step);
     test_all_step.dependOn(&run_passthrough_tests.step);
