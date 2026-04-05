@@ -32,7 +32,7 @@ Standard Linux disk tools (fdisk, gdisk, blkdiscard, sg_format) all fail to modi
 ```
 +---------------------------------------------+
 |  NVMe SSD: Silicon Power 256GB              |
-|  Controller: Phison PS5012-E12               |
+|  Controller: Phison PS5012-E12              |
 |  State: FTL corrupted, read-only mode       |
 +----------------------+----------------------+
                        | M.2 PCIe
