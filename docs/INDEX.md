@@ -8,7 +8,7 @@ This directory contains research notes, analysis, and workflow documentation for
 |----------|-------------|
 | [debug-session-summary.md](notes/debug-session-summary.md) | Hardware stack identification, ASM2362 bridge detection |
 | [darwin-post-recovery-integration.md](notes/darwin-post-recovery-integration.md) | Cross-platform note: recovered media can still fail Darwin automation access |
-| [usb-link-negotiation-field-report-2026-04.md](notes/usb-link-negotiation-field-report-2026-04.md) | Field report: recovered enclosure still negotiating only 480Mbps despite advertising USB 3.x capability |
+| [usb-link-negotiation-field-report-2026-04.md](notes/usb-link-negotiation-field-report-2026-04.md) | Field report: recovered enclosure negotiated only 480Mbps on bad signal paths, then reached 10Gbps with a dedicated SuperSpeed cable |
 | [diagnosis-findings.md](notes/diagnosis-findings.md) | Silent write failure evidence, test methodology |
 | [hardware-test-results.md](notes/hardware-test-results.md) | asm2362-tool probe/identify command outputs |
 | [linux-kernel-investigation.md](notes/linux-kernel-investigation.md) | Linux block layer, USB storage, SCSI translation analysis |

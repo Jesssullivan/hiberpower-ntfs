@@ -81,8 +81,10 @@ That means the remaining problem is no longer bridge/media recovery. It is a Dar
 This should not be misclassified as a new storage failure.
 
 A later note covers a separate transport-debug lane where the same recovered
-enclosure negotiates only `480Mbps` despite still advertising USB 3.x
-capability. See
+enclosure initially negotiated only `480Mbps` despite still advertising USB 3.x
+capability. A later `petting-zoo-mini` retest with a dedicated SuperSpeed cable
+negotiated `10Gbps (SuperSpeed+)`, so that lane now points at cable class /
+signal integrity before firmware mutation. See
 [usb-link-negotiation-field-report-2026-04.md](usb-link-negotiation-field-report-2026-04.md).
 
 What it is:

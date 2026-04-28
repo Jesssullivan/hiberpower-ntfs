@@ -1,6 +1,7 @@
 # USB Link Negotiation Field Report (April 2026)
 
 **Date**: 2026-04-22
+**Updated**: 2026-04-27 EDT
 
 ## Why This Note Exists
 
@@ -21,6 +22,30 @@ This note records a separate transport problem seen during fresh field retests:
 - but the negotiated USB link falls back to **High Speed / 480Mbps**
 
 That should not be confused with the original recovery failure.
+
+## Resolution Update: Dedicated SuperSpeed Cable
+
+On 2026-04-27 EDT, the same `petting-zoo-mini` enclosure path was retested with
+a dedicated SuperSpeed-rated USB-C cable. That changed the result materially:
+
+- macOS enumerated one external physical disk
+- the expected `Asmedia` / `ASM236X` fingerprint was visible
+- the negotiated link reported `10Gbps (SuperSpeed+)`
+- `/Volumes/TinylandSSD` resolved as APFS on `disk8s1`, container `disk8`,
+  physical store `disk7s2`
+- bounded `diskutil` probes for the volume, synthesized container, and physical
+  store all returned successfully
+- `/Volumes/TinylandSSD/tinyland` existed as the Tinyland-owned writable
+  subtree and passed write/read/delete smoke
+
+Interpretation:
+
+- the earlier `480Mbps` state was a real link/signal-path failure
+- a dedicated SuperSpeed cable fixed the `petting-zoo-mini` path
+- the pzm evidence no longer supports "firmware is globally locked to USB 2.0"
+  as the primary explanation
+- descriptor/config tooling is still useful for diagnostics, but cable class
+  and signal path should be checked before firmware mutation
 
 ## Current Field Findings
 
@@ -109,9 +134,9 @@ It only narrows the explanation:
   - host port signal path
   - enclosure hardware degradation
 
-## Golden Cable Trifecta
+## Golden Cable Result
 
-The cleanest next validation step is a known-good reference matrix:
+The original next validation step was a known-good reference matrix:
 
 1. one short, known-good `USB-C ↔ USB-C` cable
 2. one short, known-good `USB-A ↔ USB-C` cable
@@ -129,6 +154,15 @@ Failure criterion:
 
 - if the same enclosure still negotiates only `480Mbps` across all three
   reference paths, the enclosure / bridge hardware becomes the primary suspect
+
+Current result:
+
+- the known-good USB-C to USB-C path on `petting-zoo-mini` negotiated
+  `10Gbps (SuperSpeed+)`
+- that is enough to reject the strongest "always USB 2.0" firmware hypothesis
+  for this enclosure
+- the remaining optional matrix work is useful for port/cable inventory, but it
+  is no longer blocking the pzm SSD lane
 
 ## Relationship To Other Notes
 
