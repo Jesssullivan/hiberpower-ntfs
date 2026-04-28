@@ -15,6 +15,7 @@ const std = @import("std");
 const sg_io = @import("platform/scsi.zig");
 const sense = @import("scsi/sense.zig");
 const passthrough = @import("asm2362/passthrough.zig");
+const config = @import("asm2362/config.zig");
 const commands = @import("asm2362/commands.zig");
 const xram = @import("asm2362/xram.zig");
 const identify = @import("nvme/identify.zig");
@@ -29,6 +30,7 @@ const Command = enum {
     probe,
     identify,
     smart,
+    config_read,
     replay,
     get_features,
     set_features,
@@ -70,6 +72,7 @@ const Args = struct {
     feature_id: u8, // NVMe Feature ID (e.g., 0x84 for write protect)
     feature_value: u32, // Value to set for Set Features
     save_feature: bool, // Persist feature across power cycles
+    config_image: u8, // ASM2362 config image index (0 or 1)
     // Security args
     security_protocol: u8, // Security protocol (0x00=info, 0xEF=ATA password)
     sp_specific: u16, // Protocol-specific value
@@ -108,6 +111,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
         .feature_id = 0x84,
         .feature_value = 0,
         .save_feature = false,
+        .config_image = 0,
         .security_protocol = 0x00,
         .sp_specific = 0,
         .xram_address = 0xB000,
@@ -148,6 +152,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.command = .identify;
         } else if (std.mem.eql(u8, arg, "smart")) {
             result.command = .smart;
+        } else if (std.mem.eql(u8, arg, "config-read")) {
+            result.command = .config_read;
         } else if (std.mem.eql(u8, arg, "replay")) {
             result.command = .replay;
             if (i + 1 < args.len) {
@@ -168,6 +174,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             result.feature_value = std.fmt.parseInt(u32, arg[8..], 0) catch 0;
         } else if (std.mem.eql(u8, arg, "--save")) {
             result.save_feature = true;
+        } else if (std.mem.startsWith(u8, arg, "--image=")) {
+            result.config_image = std.fmt.parseInt(u8, arg[8..], 0) catch 0;
         } else if (std.mem.startsWith(u8, arg, "--protocol=")) {
             result.security_protocol = std.fmt.parseInt(u8, arg[11..], 0) catch 0;
         } else if (std.mem.startsWith(u8, arg, "--sp-specific=")) {
@@ -249,6 +257,7 @@ fn printUsage() void {
         \\    probe         Probe device capabilities and identify bridge type
         \\    identify      Get NVMe Identify Controller/Namespace data
         \\    smart         Get NVMe SMART/Health log
+        \\    config-read   Read ASM2362 bridge configuration image (0xE0)
         \\
         \\XRAM COMMANDS (bypass 0xe6 whitelist via direct bridge XRAM access):
         \\    xram-probe    Probe XRAM capabilities (safe, read-only)
@@ -286,6 +295,7 @@ fn printUsage() void {
         \\
         \\PASSTHROUGH OPTIONS:
         \\    --fid=N          Feature ID for get/set-features (default: 0x84)
+        \\    --image=N        Config image index for config-read (0 or 1, default: 0)
         \\    --value=N        Value for set-features
         \\    --save           Save feature persistently
         \\    --protocol=N     Security protocol (0x00=info, 0xEF=ATA password)
@@ -295,6 +305,7 @@ fn printUsage() void {
         \\EXAMPLES:
         \\    asm2362-tool probe /dev/sdb                              # Safe: detect bridge
         \\    asm2362-tool smart /dev/sdb --json                       # Safe: read SMART
+        \\    asm2362-tool config-read /dev/sdb --image=0              # Read config image 0
         \\    asm2362-tool xram-probe /dev/sdb                         # Safe: probe XRAM
         \\    asm2362-tool xram-dump --addr=0xB000 --len=512 /dev/sdb  # Dump Admin SQ
         \\    asm2362-tool xram-dump --addr=0xB200 --len=256 /dev/sdb  # Dump MMIO regs
@@ -348,6 +359,17 @@ pub fn main() !void {
         },
         .smart => {
             try commands.getSmartLog(allocator, device_path, args.json_output);
+        },
+        .config_read => {
+            const result = config.readConfig(device_path, args.config_image) catch |err| {
+                std.debug.print("Config read failed: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            if (args.json_output) {
+                config.printConfigJson(&result);
+            } else {
+                config.printConfigHuman(&result);
+            }
         },
         .replay => {
             const replay_file = args.replay_file orelse {

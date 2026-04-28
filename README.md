@@ -258,6 +258,28 @@ zig build test-all   # all module tests (sg_io, sense, passthrough, replay, xram
 
 ---
 
+## Post-Recovery Darwin Integration
+
+Recovery on Linux does not automatically mean the enclosure is ready as a managed macOS automation target.
+
+On 2026-04-12, the same recovered ASM2362 + NVMe path:
+
+- behaved normally on Linux (`probe` ready, normal capacity, read/write smoke test passed)
+- could be reformatted to APFS and auto-mounted on macOS
+- still returned `Operation not permitted` from `sshd` and one-shot `launchd` contexts on `petting-zoo-mini`
+
+That is a distinct failure class from the earlier `Medium not present` controller-protection state. See [docs/notes/darwin-post-recovery-integration.md](docs/notes/darwin-post-recovery-integration.md).
+
+A later April 2026 field retest found a third failure class worth separating
+from both of those: the recovered enclosure can still advertise USB 3.x
+capability while negotiating only High Speed (`480Mbps`) on a bad signal path.
+The follow-up reference-cable test on `petting-zoo-mini` negotiated
+`10Gbps (SuperSpeed+)`, which points at cable class / signal integrity rather
+than a global firmware lock to USB 2.0. See
+[docs/notes/usb-link-negotiation-field-report-2026-04.md](docs/notes/usb-link-negotiation-field-report-2026-04.md).
+
+---
+
 ## Project Structure
 
 ```
